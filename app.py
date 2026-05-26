@@ -3,199 +3,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 import sqlite3
 import pandas as pd
-import qrcode
 from datetime import datetime
-from PIL import Image
-import base64
-import html
-import hashlib
-import hmac
-import os
-import re
 
-DB_PATH = "inventory.db"
-PASSWORD_HASH_ITERATIONS = 260000
-
-def hash_password(password):
-    salt = os.urandom(16).hex()
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        bytes.fromhex(salt),
-        PASSWORD_HASH_ITERATIONS
-    ).hex()
-    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${password_hash}"
-
-def verify_password(password, stored_password):
-    if not stored_password:
-        return False, False
-
-    if stored_password.startswith("pbkdf2_sha256$"):
-        try:
-            _, iterations, salt, expected_hash = stored_password.split("$", 3)
-            password_hash = hashlib.pbkdf2_hmac(
-                "sha256",
-                password.encode("utf-8"),
-                bytes.fromhex(salt),
-                int(iterations)
-            ).hex()
-        except (ValueError, TypeError):
-            return False, False
-
-        return hmac.compare_digest(password_hash, expected_hash), False
-
-    password_matches = hmac.compare_digest(password, stored_password)
-    return password_matches, password_matches
-
-def safe_html(value):
-    return html.escape("" if value is None else str(value), quote=True)
-
-def get_initial_admin_password():
-    password = os.getenv("INVENTORY_ADMIN_PASSWORD")
-    if password:
-        return password
-
-    try:
-        return st.secrets.get("INITIAL_ADMIN_PASSWORD")
-    except Exception:
-        return None
-
-def qr_file_path(item_code):
-    item_code_text = str(item_code)
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_code_text).strip("._")
-    safe_name = safe_name or "item"
-    digest = hashlib.sha256(item_code_text.encode("utf-8")).hexdigest()[:8]
-    return f"qr_{safe_name}_{digest}.png"
-
-def decode_qr_from_image(uploaded_image):
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return None, "OpenCV is not installed. Run: pip install -r requirements.txt"
-
-    image = Image.open(uploaded_image).convert("RGB")
-    image_array = np.array(image)
-    detector = cv2.QRCodeDetector()
-    decoded_text, _, _ = detector.detectAndDecode(image_array)
-
-    if decoded_text:
-        return decoded_text.strip(), None
-
-    if hasattr(cv2, "barcode_BarcodeDetector"):
-        try:
-            barcode_detector = cv2.barcode_BarcodeDetector()
-            barcode_result = barcode_detector.detectAndDecode(image_array)
-
-            if len(barcode_result) >= 2:
-                decoded_info = barcode_result[1]
-
-                if decoded_info is None:
-                    return None, "No QR or barcode detected. Try a clearer image with the code centered."
-
-                if isinstance(decoded_info, str) and decoded_info:
-                    return decoded_info.strip(), None
-
-                for decoded_value in decoded_info:
-                    if decoded_value:
-                        return decoded_value.strip(), None
-
-        except cv2.error:
-            pass
-
-    return None, "No QR or barcode detected. Try a clearer image with the code centered."
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password TEXT,
-        role TEXT
-    )
-    ''')
-
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_code TEXT UNIQUE,
-        item_name TEXT,
-        description TEXT,
-        quantity INTEGER
-    )
-    ''')
-
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        item_code TEXT,
-        quantity_used INTEGER,
-        transaction_time TEXT
-    )
-    ''')
-
-    conn.commit()
-    conn.close()
-
-def add_default_admin():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    c.execute("SELECT * FROM users WHERE username='admin'")
-    if not c.fetchone():
-        initial_admin_password = get_initial_admin_password()
-        if not initial_admin_password:
-            conn.close()
-            return
-
-        c.execute(
-            "INSERT INTO users (username,password,role) VALUES (?,?,?)",
-            ("admin", hash_password(initial_admin_password), "admin")
-        )
-
-    conn.commit()
-    conn.close()
-
-def login(username, password):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    c.execute(
-        "SELECT * FROM users WHERE username=?",
-        (username,)
-    )
-
-    user = c.fetchone()
-    if not user:
-        conn.close()
-        return None
-
-    password_matches, should_upgrade_hash = verify_password(password, user[2])
-
-    if password_matches and should_upgrade_hash:
-        c.execute(
-            "UPDATE users SET password=? WHERE id=?",
-            (hash_password(password), user[0])
-        )
-        conn.commit()
-
-    conn.close()
-
-    return user if password_matches else None
-
-def generate_qr(item_code):
-    qr = qrcode.make(item_code)
-    path = qr_file_path(item_code)
-    qr.save(path)
-    return path
-
-def image_to_base64(path):
-    with open(path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
+from auth import add_default_admin, hash_password, login
+from db import get_connection, init_db
+from utils import decode_qr_from_image, generate_qr, image_to_base64, safe_html
 
 init_db()
 add_default_admin()
@@ -560,6 +372,112 @@ else:
             padding: 1.1rem;
         }
 
+        .workflow-panel {
+            background:
+                radial-gradient(circle at top right, rgba(14, 165, 233, 0.1), transparent 10rem),
+                #ffffff;
+            border: 1px solid rgba(14, 165, 233, 0.16);
+            border-radius: 12px;
+            box-shadow: 0 14px 30px rgba(15, 23, 42, 0.06);
+            padding: 1rem;
+            margin-bottom: 0.85rem;
+        }
+
+        .workflow-kicker {
+            color: #0e7490;
+            font-size: 0.76rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: 0.25rem;
+        }
+
+        .workflow-title {
+            color: #0f172a;
+            font-size: 1.08rem;
+            font-weight: 850;
+            margin-bottom: 0.25rem;
+        }
+
+        .workflow-text {
+            color: #64748b;
+            font-size: 0.88rem;
+            line-height: 1.4;
+            margin-bottom: 0.7rem;
+        }
+
+        .action-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.7rem;
+            margin-top: 0.8rem;
+        }
+
+        .action-summary-card {
+            background: #f8fafc;
+            border: 1px solid rgba(14, 165, 233, 0.12);
+            border-radius: 12px;
+            padding: 0.85rem;
+        }
+
+        .action-summary-label {
+            color: #64748b;
+            font-size: 0.72rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: 0.3rem;
+        }
+
+        .action-summary-value {
+            color: #0f172a;
+            font-size: 1.25rem;
+            font-weight: 850;
+            line-height: 1;
+        }
+
+        [data-testid="stTextInput"] input,
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stDateInput"] input {
+            background: #ffffff !important;
+            color: #0f172a !important;
+            border: 1px solid rgba(37, 99, 235, 0.22) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06) !important;
+        }
+
+        [data-testid="stTextInput"] input::placeholder,
+        [data-testid="stTextArea"] textarea::placeholder,
+        [data-testid="stNumberInput"] input::placeholder,
+        [data-testid="stDateInput"] input::placeholder {
+            color: #64748b !important;
+            opacity: 1 !important;
+        }
+
+        [data-testid="stTextInput"] input:focus,
+        [data-testid="stTextArea"] textarea:focus,
+        [data-testid="stNumberInput"] input:focus,
+        [data-testid="stDateInput"] input:focus {
+            border-color: #2563eb !important;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14), 0 8px 20px rgba(15, 23, 42, 0.06) !important;
+        }
+
+        [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+            background: #ffffff !important;
+            color: #0f172a !important;
+            border: 1px solid rgba(37, 99, 235, 0.22) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06) !important;
+        }
+
+        [data-testid="stTextInput"] label p,
+        [data-testid="stTextArea"] label p,
+        [data-testid="stNumberInput"] label p,
+        [data-testid="stDateInput"] label p,
+        [data-testid="stSelectbox"] label p {
+            color: #0f172a !important;
+            font-weight: 700 !important;
+        }
+
         .item-card {
             background: #ffffff;
             border: 1px solid rgba(49, 51, 63, 0.08);
@@ -704,6 +622,122 @@ else:
             font-size: 1.55rem;
         }
 
+        .user-metric-card {
+            background:
+                radial-gradient(circle at top right, rgba(14, 165, 233, 0.14), transparent 8rem),
+                linear-gradient(145deg, #ffffff 0%, #f4fbff 100%);
+            border: 1px solid rgba(14, 165, 233, 0.16);
+            border-radius: 8px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+            padding: 1rem;
+            min-height: 118px;
+            position: relative;
+        }
+
+        .user-metric-card::after {
+            content: "";
+            position: absolute;
+            left: 1rem;
+            right: 1rem;
+            bottom: 0.7rem;
+            height: 3px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #0ea5e9, #14b8a6);
+        }
+
+        .user-metric-label {
+            color: #64748b;
+            font-size: 0.78rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+        }
+
+        .user-metric-value {
+            color: #0f172a;
+            font-size: 1.85rem;
+            font-weight: 850;
+            line-height: 1;
+            margin-bottom: 0.5rem;
+        }
+
+        .user-metric-note {
+            color: #64748b;
+            font-size: 0.8rem;
+            padding-bottom: 0.55rem;
+        }
+
+        .user-chart-card {
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96));
+            border: 1px solid rgba(14, 165, 233, 0.14);
+            border-radius: 8px;
+            box-shadow: 0 16px 32px rgba(15, 23, 42, 0.07);
+            padding: 1.05rem;
+            min-height: 320px;
+        }
+
+        .user-chart-title {
+            color: #0f172a;
+            font-size: 1.02rem;
+            font-weight: 850;
+            margin-bottom: 0.7rem;
+        }
+
+        .user-chart-badge {
+            background: #ecfeff;
+            border-radius: 999px;
+            color: #0e7490;
+            font-size: 0.72rem;
+            font-weight: 850;
+            padding: 0.25rem 0.55rem;
+            white-space: nowrap;
+        }
+
+        .user-stock-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.75rem;
+            align-items: center;
+            padding: 0.68rem 0;
+            border-bottom: 1px solid rgba(14, 165, 233, 0.12);
+        }
+
+        .user-stock-row:last-child {
+            border-bottom: 0;
+        }
+
+        .user-stock-name {
+            color: #0f172a;
+            font-size: 0.88rem;
+            font-weight: 850;
+        }
+
+        .user-stock-meta {
+            color: #64748b;
+            font-size: 0.76rem;
+            margin-top: 0.15rem;
+        }
+
+        .user-stock-qty {
+            color: #0e7490;
+            font-size: 0.95rem;
+            font-weight: 850;
+        }
+
+        .user-stock-track {
+            height: 8px;
+            background: #e0f2fe;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-top: 0.45rem;
+        }
+
+        .user-stock-fill {
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #0ea5e9, #14b8a6);
+        }
+
         .quick-action-panel {
             background: rgba(255, 255, 255, 0.94);
             border: 1px solid rgba(32, 48, 24, 0.08);
@@ -799,6 +833,7 @@ else:
         }
 
         .user-action-card {
+            display: none;
             background: rgba(255, 255, 255, 0.95);
             border: 1px solid rgba(32, 48, 24, 0.08);
             border-radius: 16px;
@@ -1240,75 +1275,6 @@ else:
             font-weight: 850;
         }
 
-        .inventory-table {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            border-radius: 12px;
-            overflow: hidden;
-            background: #ffffff;
-            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
-        }
-
-        .inventory-table-body {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            border-top: 0;
-            border-radius: 0 0 12px 12px;
-            overflow: hidden;
-            background: #ffffff;
-            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
-        }
-
-        .inventory-table + .inventory-action-buttons.inventory-table-body {
-            margin-top: -1px;
-        }
-
-        .inventory-row {
-            display: grid;
-            grid-template-columns: 1fr 1.4fr 2fr 0.7fr 0.8fr;
-            gap: 0;
-            align-items: center;
-            background: #ffffff;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.2);
-            min-height: 48px;
-        }
-
-        .inventory-row.header {
-            background: #f8fafc;
-            color: #64748b;
-            font-size: 0.78rem;
-            font-weight: 750;
-            text-transform: uppercase;
-            min-height: 42px;
-        }
-
-        .inventory-row:last-child {
-            border-bottom: 0;
-        }
-
-        .inventory-row > div {
-            padding: 0.72rem 0.8rem;
-            border-right: 1px solid rgba(148, 163, 184, 0.18);
-            min-width: 0;
-        }
-
-        .inventory-row > div:last-child {
-            border-right: 0;
-        }
-
-        .inventory-cell-strong {
-            color: #0f172a;
-            font-size: 0.9rem;
-            font-weight: 800;
-        }
-
-        .inventory-cell {
-            color: #334155;
-            font-size: 0.88rem;
-            font-weight: 650;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
         .inventory-action-buttons .stButton > button {
             border: 0;
             border-radius: 10px;
@@ -1362,10 +1328,6 @@ else:
             margin: 0 !important;
         }
 
-        .inventory-action-buttons .inventory-row {
-            border-radius: 0;
-        }
-
         .inventory-stream-cell {
             min-height: 50px;
             display: flex;
@@ -1394,15 +1356,6 @@ else:
             font-size: 0.78rem;
             font-weight: 800;
             text-transform: uppercase;
-        }
-
-        .inventory-stream-action {
-            min-height: 50px;
-            display: flex;
-            align-items: center;
-            padding: 0.42rem 0.65rem;
-            background: #ffffff;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.2);
         }
 
         .inventory-action-buttons [data-testid="stButton"] {
@@ -1606,9 +1559,9 @@ else:
     st.sidebar.markdown(
         """
         <div class="sidebar-brand">
-            <div class="sidebar-brand-mark">IM</div>
+            <div class="sidebar-brand-mark">TE</div>
             <div>
-                <div class="sidebar-brand-title">Inventory System</div>
+                <div class="sidebar-brand-title">Tarakji Enterprise<div>
                 <div class="sidebar-brand-subtitle">Stock control panel</div>
             </div>
         </div>
@@ -1633,11 +1586,12 @@ else:
     }
 
     menu_icons["Manage Sales"] = "$"
+    menu_icons["Sell Item"] = "$"
 
     if st.session_state.role == "admin":
         main_items = ["Dashboard", "Transaction Logs"]
     else:
-        main_items = ["Dashboard", "Scan Inventory", "Scan QR / Barcode", "Transaction Logs"]
+        main_items = ["Dashboard", "Scan Inventory", "Scan QR / Barcode", "Sell Item", "Transaction Logs"]
 
     admin_items = ["Add Inventory", "View Inventory", "Print QR Codes", "Manage Sales", "User Management"] if st.session_state.role == "admin" else []
 
@@ -1697,59 +1651,219 @@ else:
 
     if menu == "Dashboard" and st.session_state.role != "admin":
         username_safe = safe_html(st.session_state.username)
+        conn = get_connection()
+        user_transactions_df = pd.read_sql_query(
+            "SELECT * FROM transactions WHERE username=? ORDER BY id DESC",
+            conn,
+            params=(st.session_state.username,)
+        )
+        user_stock_df = pd.read_sql_query(
+            '''
+            SELECT ui.item_code, ui.quantity, i.item_name
+            FROM user_inventory ui
+            LEFT JOIN inventory i ON ui.item_code = i.item_code
+            WHERE ui.username=?
+            ORDER BY ui.quantity DESC
+            ''',
+            conn,
+            params=(st.session_state.username,)
+        )
+        conn.close()
+
+        if not user_transactions_df.empty:
+            user_transactions_df["transaction_type"] = user_transactions_df["transaction_type"].fillna("legacy")
+
+        user_total_stock = int(user_stock_df["quantity"].sum()) if not user_stock_df.empty else 0
+        user_total_sold = (
+            int(user_transactions_df.loc[user_transactions_df["transaction_type"] == "sale", "quantity_used"].sum())
+            if not user_transactions_df.empty else 0
+        )
+        user_total_allocated = (
+            int(user_transactions_df.loc[user_transactions_df["transaction_type"] == "allocation", "quantity_used"].sum())
+            if not user_transactions_df.empty else 0
+        )
+        user_item_count = int((user_stock_df["quantity"] > 0).sum()) if not user_stock_df.empty else 0
+        user_stock_chart_html = '<div class="analytics-empty">No assigned stock yet.</div>'
+
+        if not user_stock_df.empty:
+            stock_chart_df = user_stock_df[user_stock_df["quantity"] > 0].head(6)
+
+            if not stock_chart_df.empty:
+                max_user_stock = max(int(stock_chart_df["quantity"].max()), 1)
+                stock_chart_rows = []
+
+                for _, row in stock_chart_df.iterrows():
+                    item_label = safe_html(row["item_name"] or row["item_code"])
+                    item_code_safe = safe_html(row["item_code"])
+                    quantity = int(row["quantity"])
+                    percent = min(int((quantity / max_user_stock) * 100), 100)
+                    stock_chart_rows.append(
+                        f"""
+                        <div class="user-stock-row">
+                            <div>
+                                <div class="user-stock-name">{item_label}</div>
+                                <div class="user-stock-meta">{item_code_safe}</div>
+                                <div class="user-stock-track">
+                                    <div class="user-stock-fill" style="width: {percent}%"></div>
+                                </div>
+                            </div>
+                            <div class="user-stock-qty">{quantity}</div>
+                        </div>
+                        """
+                    )
+
+                user_stock_chart_html = "".join(stock_chart_rows)
+
+        user_activity_chart_html = '<div class="analytics-empty">No activity yet.</div>'
+        user_activity_total = user_total_sold + user_total_allocated
+
+        if user_activity_total:
+            received_percent = round((user_total_allocated / user_activity_total) * 100, 1)
+            sold_percent = round((user_total_sold / user_activity_total) * 100, 1)
+            user_activity_chart_html = (
+                f'<div class="donut-layout">'
+                f'<div class="donut-chart" style="background: conic-gradient(#0ea5e9 0% {received_percent}%, #14b8a6 {received_percent}% 100%);"></div>'
+                f'<div class="donut-legend">'
+                f'<div class="donut-legend-row"><span class="donut-dot" style="background: #0ea5e9;"></span><span>Received</span><span class="donut-percent">{received_percent}%</span></div>'
+                f'<div class="donut-legend-row"><span class="donut-dot" style="background: #14b8a6;"></span><span>Sold</span><span class="donut-percent">{sold_percent}%</span></div>'
+                f'</div>'
+                f'</div>'
+            )
 
         st.markdown(
             f"""
             <div class="page-header">
                 <div class="page-eyebrow">User Dashboard</div>
                 <div class="page-title">Welcome, {username_safe}</div>
-                <p class="page-subtitle">Choose how you want to find an inventory item.</p>
+                <p class="page-subtitle">Track your assigned stock, sales activity, and recent inventory movement.</p>
             </div>
             """,
             unsafe_allow_html=True
         )
+        st.markdown('<div class="dashboard-section-title">My Reports & Analytics</div>', unsafe_allow_html=True)
+        report_col1, report_col2, report_col3, report_col4 = st.columns(4)
 
-        st.markdown('<div class="user-dashboard-actions">', unsafe_allow_html=True)
-
-        action_col1, action_col2 = st.columns(2)
-
-        with action_col1:
+        with report_col1:
             st.markdown(
-                """
-                <div class="user-action-card">
-                    <div class="user-action-icon">▣</div>
-                    <div class="user-action-chip-title">Scan QR / Barcode</div>
-                    <div class="user-action-chip-text">Open the camera scanner.</div>
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">My Stock</div>
+                    <div class="user-metric-value">{user_total_stock}</div>
+                    <div class="user-metric-note">Units currently assigned</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            if st.button("Open Scanner", width="stretch"):
-                st.session_state.menu = "Scan QR / Barcode"
-                st.rerun()
-
-        with action_col2:
+        with report_col2:
             st.markdown(
-                """
-                <div class="user-action-card">
-                    <div class="user-action-icon">⌕</div>
-                    <div class="user-action-chip-title">Scan Inventory</div>
-                    <div class="user-action-chip-text">Enter an item code manually.</div>
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Items Held</div>
+                    <div class="user-metric-value">{user_item_count}</div>
+                    <div class="user-metric-note">Items with available quantity</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            if st.button("Open Manual Lookup", width="stretch"):
-                st.session_state.menu = "Scan Inventory"
-                st.rerun()
+        with report_col3:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Sold</div>
+                    <div class="user-metric-value">{user_total_sold}</div>
+                    <div class="user-metric-note">Units sold by you</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-        st.markdown('</div>', unsafe_allow_html=True)
+        with report_col4:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Received</div>
+                    <div class="user-metric-value">{user_total_allocated}</div>
+                    <div class="user-metric-note">Units added from inventory</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        chart_col1, chart_col2 = st.columns([1.15, 0.85])
+
+        with chart_col1:
+            st.html(
+                f"""
+                <div class="user-chart-card">
+                    <div class="analytics-card-header">
+                        <div class="user-chart-title">My Stock by Item</div>
+                        <div class="user-chart-badge">Current stock</div>
+                    </div>
+                    {user_stock_chart_html}
+                </div>
+                """
+            )
+
+        with chart_col2:
+            st.html(
+                f"""
+                <div class="user-chart-card">
+                    <div class="analytics-card-header">
+                        <div class="user-chart-title">Received vs Sold</div>
+                        <div class="user-chart-badge">Activity mix</div>
+                    </div>
+                    {user_activity_chart_html}
+                </div>
+                """
+            )
+
+        user_report_col1, user_report_col2 = st.columns(2)
+
+        with user_report_col1:
+            with st.container(border=True):
+                st.markdown('<div class="admin-panel-title">My Current Stock</div>', unsafe_allow_html=True)
+                if user_stock_df.empty:
+                    st.info("No items assigned yet.")
+                else:
+                    stock_display_df = user_stock_df.rename(
+                        columns={
+                            "item_code": "Item Code",
+                            "item_name": "Item Name",
+                            "quantity": "My Quantity",
+                        }
+                    )
+                    st.dataframe(stock_display_df, width="stretch", hide_index=True)
+
+        with user_report_col2:
+            with st.container(border=True):
+                st.markdown('<div class="admin-panel-title">Recent Activity</div>', unsafe_allow_html=True)
+                if user_transactions_df.empty:
+                    st.info("No activity yet.")
+                else:
+                    recent_user_df = user_transactions_df.head(5)[
+                        ["item_code", "transaction_type", "quantity_used", "quantity_after", "transaction_time"]
+                    ].copy()
+                    recent_user_df["transaction_type"] = recent_user_df["transaction_type"].replace({
+                        "allocation": "Added to My Stock",
+                        "sale": "Sold Item",
+                        "legacy": "Legacy Record",
+                    })
+                    recent_user_df = recent_user_df.rename(
+                        columns={
+                            "item_code": "Item Code",
+                            "transaction_type": "Action",
+                            "quantity_used": "Quantity",
+                            "quantity_after": "My Qty After",
+                            "transaction_time": "Time",
+                        }
+                    )
+                    st.dataframe(recent_user_df, width="stretch", hide_index=True)
 
     if menu == "Dashboard" and st.session_state.role == "admin":
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
 
         inventory_df = pd.read_sql_query(
             "SELECT * FROM inventory",
@@ -1781,7 +1895,7 @@ else:
             <div class="admin-dashboard-header">
                 <div>
                     <div class="admin-dashboard-title">Dashboard</div>
-                    <div class="admin-dashboard-subtitle">Welcome back, {username_safe}. Here's what's happening with your inventory system.</div>
+                    <div class="admin-dashboard-subtitle">Welcome back, {username_safe}. Here's what's happening with your Tarakji Enterprise<.</div>
                 </div>
                 <div class="admin-profile-pill">
                     <div class="admin-profile-avatar">A</div>
@@ -2138,7 +2252,7 @@ else:
                 if not item_code.strip() or not item_name.strip():
                     st.error("Item code and item name are required.")
                 else:
-                    conn = sqlite3.connect(DB_PATH)
+                    conn = get_connection()
                     c = conn.cursor()
 
                     try:
@@ -2165,7 +2279,7 @@ else:
 
         if menu == "View Inventory":
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_connection()
 
             df = pd.read_sql_query(
                 "SELECT * FROM inventory",
@@ -2352,10 +2466,13 @@ else:
                             if not edit_item_code.strip() or not edit_item_name.strip():
                                 st.error("Item code and item name are required.")
                             else:
-                                conn = sqlite3.connect(DB_PATH)
+                                old_item_code = str(selected_item["item_code"])
+                                new_item_code = edit_item_code.strip()
+                                conn = get_connection()
                                 c = conn.cursor()
 
                                 try:
+                                    c.execute("BEGIN IMMEDIATE")
                                     c.execute(
                                         '''
                                         UPDATE inventory
@@ -2363,19 +2480,52 @@ else:
                                         WHERE id=?
                                         ''',
                                         (
-                                            edit_item_code.strip(),
+                                            new_item_code,
                                             edit_item_name.strip(),
                                             edit_description.strip(),
                                             edit_quantity,
                                             selected_item_id
                                         )
                                     )
+
+                                    if old_item_code != new_item_code:
+                                        c.execute(
+                                            '''
+                                            SELECT username, quantity
+                                            FROM user_inventory
+                                            WHERE item_code=?
+                                            ''',
+                                            (old_item_code,)
+                                        )
+                                        old_user_stock_rows = c.fetchall()
+
+                                        for stock_username, stock_quantity in old_user_stock_rows:
+                                            c.execute(
+                                                '''
+                                                INSERT INTO user_inventory (username,item_code,quantity)
+                                                VALUES (?,?,?)
+                                                ON CONFLICT(username,item_code)
+                                                DO UPDATE SET quantity=user_inventory.quantity + excluded.quantity
+                                                ''',
+                                                (stock_username, new_item_code, int(stock_quantity))
+                                            )
+
+                                        c.execute(
+                                            "DELETE FROM user_inventory WHERE item_code=?",
+                                            (old_item_code,)
+                                        )
+                                        c.execute(
+                                            "UPDATE transactions SET item_code=? WHERE item_code=?",
+                                            (new_item_code, old_item_code)
+                                        )
+
                                     conn.commit()
                                     st.session_state.inventory_message = "Inventory updated successfully."
                                     st.session_state.manage_inventory_id = None
                                     st.rerun()
 
                                 except sqlite3.IntegrityError:
+                                    conn.rollback()
                                     st.error("Another item already uses this item code.")
 
                                 finally:
@@ -2404,8 +2554,12 @@ else:
                             disabled=not confirm_delete,
                             width="stretch"
                         ):
-                            conn = sqlite3.connect(DB_PATH)
+                            conn = get_connection()
                             c = conn.cursor()
+                            c.execute(
+                                "DELETE FROM user_inventory WHERE item_code=?",
+                                (str(selected_item["item_code"]),)
+                            )
                             c.execute(
                                 "DELETE FROM inventory WHERE id=?",
                                 (int(selected_item["id"]),)
@@ -2418,7 +2572,7 @@ else:
 
         if menu == "Print QR Codes":
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_connection()
 
             df = pd.read_sql_query(
                 "SELECT * FROM inventory ORDER BY item_name",
@@ -2558,7 +2712,7 @@ else:
 
         if menu == "User Management":
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_connection()
 
             users_df = pd.read_sql_query(
                 "SELECT id, username, role FROM users ORDER BY id",
@@ -2640,7 +2794,7 @@ else:
                     if not new_username.strip() or not new_password.strip():
                         st.error("Username and password are required.")
                     else:
-                        conn = sqlite3.connect(DB_PATH)
+                        conn = get_connection()
                         c = conn.cursor()
 
                         try:
@@ -2689,8 +2843,12 @@ else:
                         )
 
                         if st.button("Delete Selected User", type="secondary", width="stretch"):
-                            conn = sqlite3.connect(DB_PATH)
+                            conn = get_connection()
                             c = conn.cursor()
+                            c.execute(
+                                "DELETE FROM user_inventory WHERE username=?",
+                                (user_to_delete,)
+                            )
                             c.execute(
                                 "DELETE FROM users WHERE username=?",
                                 (user_to_delete,)
@@ -2702,7 +2860,7 @@ else:
 
     if menu == "Manage Sales":
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         sales_df = pd.read_sql_query(
             "SELECT * FROM transactions ORDER BY id DESC",
             conn
@@ -2720,9 +2878,14 @@ else:
             unsafe_allow_html=True
         )
 
+        if not sales_df.empty:
+            sales_df = sales_df[sales_df["transaction_type"] == "sale"].copy()
+
         if sales_df.empty:
             st.info("No sales records found yet. User sales will appear here after inventory is scanned or submitted.")
         else:
+            sales_df["quantity_before"] = sales_df["quantity_before"].fillna(0).astype(int)
+            sales_df["quantity_after"] = sales_df["quantity_after"].fillna(0).astype(int)
             sales_df["sale_date"] = pd.to_datetime(
                 sales_df["transaction_time"],
                 errors="coerce"
@@ -2870,21 +3033,40 @@ else:
             if filtered_sales_df.empty:
                 st.info("No sales records match the selected filters.")
             else:
-                records_df = filtered_sales_df[
-                    ["id", "username", "item_code", "quantity_used", "transaction_time"]
-                ].copy()
-                st.dataframe(
-                    records_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "username": "Sales User",
-                        "item_code": "Item Code",
-                        "quantity_used": "Quantity Sold",
-                        "transaction_time": "Sale Time",
-                    }
+                sales_record_search = st.text_input(
+                    "Search Sales Records",
+                    placeholder="Search by sales user or item code",
+                    label_visibility="collapsed",
+                    key="sales_record_search"
                 )
+
+                if sales_record_search:
+                    sales_record_search = sales_record_search.lower().strip()
+                    filtered_sales_df = filtered_sales_df[
+                        filtered_sales_df["username"].str.lower().str.contains(sales_record_search, na=False)
+                        | filtered_sales_df["item_code"].str.lower().str.contains(sales_record_search, na=False)
+                    ]
+
+                if filtered_sales_df.empty:
+                    st.info("No sales records match the search.")
+                else:
+                    records_df = filtered_sales_df[
+                        ["id", "username", "item_code", "quantity_before", "quantity_used", "quantity_after", "transaction_time"]
+                    ].copy()
+                    st.dataframe(
+                        records_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "id": "ID",
+                            "username": "Sales User",
+                            "item_code": "Item Code",
+                            "quantity_before": "User Qty Before Sale",
+                            "quantity_used": "Quantity Sold",
+                            "quantity_after": "User Qty After Sale",
+                            "transaction_time": "Sale Time",
+                        }
+                    )
 
     if menu == "Scan QR / Barcode":
 
@@ -2935,12 +3117,16 @@ else:
 
     if menu == "Scan Inventory":
 
+        if "scan_inventory_message" in st.session_state:
+            st.success(st.session_state.scan_inventory_message)
+            del st.session_state.scan_inventory_message
+
         st.markdown(
             """
             <div class="page-header">
-                <div class="page-eyebrow">Inventory Usage</div>
+                <div class="page-eyebrow">Inventory Lookup</div>
                 <div class="page-title">Scan Inventory</div>
-                <p class="page-subtitle">Enter an item code, review stock details, and record quantity used.</p>
+                <p class="page-subtitle">Enter an item code to review stock details before selling or checking inventory.</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -2950,35 +3136,47 @@ else:
 
         with lookup_col:
             if "prefill_scan_item_code" in st.session_state:
-                st.session_state.scan_item_code = st.session_state.prefill_scan_item_code
+                st.session_state.scan_lookup_code = st.session_state.prefill_scan_item_code
+                st.session_state.scan_selected_item_code = st.session_state.prefill_scan_item_code
                 del st.session_state.prefill_scan_item_code
 
-            st.markdown('<div class="dashboard-section-title">Item Lookup</div>', unsafe_allow_html=True)
             st.markdown(
                 """
-                <div class="content-panel">
-                    <div class="dashboard-card-label">Item Code</div>
-                    <div class="dashboard-card-note">Type or paste the code printed on the QR label.</div>
+                <div class="workflow-panel">
+                    <div class="workflow-kicker">Step 1</div>
+                    <div class="workflow-title">Find Inventory Item</div>
+                    <div class="workflow-text">Enter the item code from the QR label. After the item loads, choose how many units to add to your stock.</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            item_code = st.text_input(
-                "Item Code",
-                key="scan_item_code",
-                placeholder="Enter item code, for example 123"
-            )
+            with st.form("scan_inventory_lookup_form"):
+                scan_lookup_code = st.text_input(
+                    "Item Code",
+                    key="scan_lookup_code",
+                    placeholder="Enter item code, for example 123"
+                )
+                lookup_submitted = st.form_submit_button(
+                    "View Item Details",
+                    type="primary",
+                    width="stretch"
+                )
+
+            if lookup_submitted:
+                st.session_state.scan_selected_item_code = scan_lookup_code.strip()
+
+            item_code = st.session_state.get("scan_selected_item_code", "").strip()
 
         with detail_col:
-            st.markdown('<div class="dashboard-section-title">Item Details</div>', unsafe_allow_html=True)
+            st.markdown('<div class="dashboard-section-title">Receive Stock</div>', unsafe_allow_html=True)
 
             if not item_code:
-                st.info("Enter an item code to view item details.")
+                st.info("Enter an item code on the left to load the item and receive stock.")
 
         if item_code:
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_connection()
             c = conn.cursor()
 
             c.execute(
@@ -2994,6 +3192,15 @@ else:
                 status_text = "Low stock" if item[4] <= 5 else "In stock"
                 item_name_safe = safe_html(item[2])
                 item_description_safe = safe_html(item[3])
+                c.execute(
+                    '''
+                    SELECT quantity FROM user_inventory
+                    WHERE username=? AND item_code=?
+                    ''',
+                    (st.session_state.username, item_code)
+                )
+                user_inventory_row = c.fetchone()
+                user_quantity = int(user_inventory_row[0]) if user_inventory_row else 0
 
                 with detail_col:
                     st.markdown(
@@ -3003,7 +3210,7 @@ else:
                             <div class="item-name">{item_name_safe}</div>
                             <div class="item-meta">{item_description_safe}</div>
                             <div class="quantity-pill">
-                                <div class="quantity-pill-label">AVAILABLE QUANTITY</div>
+                                <div class="quantity-pill-label">SYSTEM AVAILABLE QUANTITY</div>
                                 <div class="quantity-pill-value">{item[4]}</div>
                             </div>
                         </div>
@@ -3011,47 +3218,128 @@ else:
                         unsafe_allow_html=True
                     )
 
-                    qty = st.number_input(
-                        "Quantity Used",
+                    transfer_qty = st.number_input(
+                        "Quantity to Add to My Stock",
                         min_value=1,
-                        step=1
+                        step=1,
+                        key="scan_transfer_quantity"
                     )
 
-                    if st.button("Submit Usage", type="primary"):
+                    user_after_preview = user_quantity + int(transfer_qty)
+                    system_after_preview = max(int(item[4]) - int(transfer_qty), 0)
 
-                        c.execute(
-                            '''
-                            UPDATE inventory
-                            SET quantity = quantity - ?
-                            WHERE item_code = ? AND quantity >= ?
-                            ''',
-                            (qty, item_code, qty)
-                        )
+                    st.markdown(
+                        f"""
+                        <div class="content-panel">
+                            <div class="workflow-kicker">Stock Preview</div>
+                            <div class="action-summary-grid">
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">My Current Qty</div>
+                                    <div class="action-summary-value">{user_quantity}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">Adding</div>
+                                    <div class="action-summary-value">{int(transfer_qty)}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">My Qty After</div>
+                                    <div class="action-summary-value">{user_after_preview}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">System Qty After</div>
+                                    <div class="action-summary-value">{system_after_preview}</div>
+                                </div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
-                        if c.rowcount == 1:
-                            c.execute(
+                    if st.button("Add to My Stock", type="primary", width="stretch"):
+                        transfer_conn = get_connection()
+                        transfer_c = transfer_conn.cursor()
+
+                        try:
+                            transfer_c.execute("BEGIN IMMEDIATE")
+                            transfer_c.execute(
+                                "SELECT id, quantity FROM inventory WHERE item_code=?",
+                                (item_code,)
+                            )
+                            current_inventory = transfer_c.fetchone()
+
+                            transfer_c.execute(
                                 '''
-                                INSERT INTO transactions
-                                (username,item_code,quantity_used,transaction_time)
-                                VALUES (?,?,?,?)
+                                SELECT quantity FROM user_inventory
+                                WHERE username=? AND item_code=?
                                 ''',
-                                (
-                                    st.session_state.username,
-                                    item_code,
-                                    qty,
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                )
+                                (st.session_state.username, item_code)
                             )
+                            current_user_inventory = transfer_c.fetchone()
 
-                            conn.commit()
+                            if not current_inventory:
+                                transfer_conn.rollback()
+                                st.error("Item not found. Check the item code and try again.")
+                            else:
+                                system_quantity_before = int(current_inventory[1])
+                                user_quantity_before = int(current_user_inventory[0]) if current_user_inventory else 0
+                                transfer_qty_int = int(transfer_qty)
 
-                            st.success(
-                                f"Inventory updated successfully. {qty} unit(s) deducted from {item[2]} and the transaction was saved."
-                            )
+                                if transfer_qty_int > system_quantity_before:
+                                    transfer_conn.rollback()
+                                    st.error("Not enough system stock available.")
+                                else:
+                                    system_quantity_after = system_quantity_before - transfer_qty_int
+                                    user_quantity_after = user_quantity_before + transfer_qty_int
 
-                        else:
-                            conn.rollback()
-                            st.error("Not enough inventory available.")
+                                    transfer_c.execute(
+                                        '''
+                                        UPDATE inventory
+                                        SET quantity=?
+                                        WHERE id=?
+                                        ''',
+                                        (system_quantity_after, int(current_inventory[0]))
+                                    )
+
+                                    transfer_c.execute(
+                                        '''
+                                        INSERT INTO user_inventory (username,item_code,quantity)
+                                        VALUES (?,?,?)
+                                        ON CONFLICT(username,item_code)
+                                        DO UPDATE SET quantity=excluded.quantity
+                                        ''',
+                                        (st.session_state.username, item_code, user_quantity_after)
+                                    )
+
+                                    transfer_c.execute(
+                                        '''
+                                        INSERT INTO transactions
+                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
+                                        VALUES (?,?,?,?,?,?,?)
+                                        ''',
+                                        (
+                                            st.session_state.username,
+                                            item_code,
+                                            transfer_qty_int,
+                                            user_quantity_before,
+                                            user_quantity_after,
+                                            "allocation",
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        )
+                                    )
+
+                                    transfer_conn.commit()
+                                    st.session_state.scan_inventory_message = (
+                                        f"{transfer_qty_int} unit(s) added to your stock. Your quantity is now {user_quantity_after}. System remaining quantity is {system_quantity_after}."
+                                    )
+                                    st.rerun()
+
+                        finally:
+                            transfer_conn.close()
+
+                    if st.button("Go to Sell Item", width="stretch"):
+                        st.session_state.prefill_sell_item_code = item_code
+                        st.session_state.menu = "Sell Item"
+                        st.rerun()
 
             else:
                 with detail_col:
@@ -3059,9 +3347,219 @@ else:
 
             conn.close()
 
+    if menu == "Sell Item":
+
+        if "sell_item_message" in st.session_state:
+            st.success(st.session_state.sell_item_message)
+            del st.session_state.sell_item_message
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">User Sale</div>
+                <div class="page-title">Sell Item</div>
+                <p class="page-subtitle">Enter an item code, choose quantity sold, and save the sale with remaining stock.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        sell_lookup_col, sell_detail_col = st.columns([0.9, 1.1])
+
+        with sell_lookup_col:
+            if "prefill_sell_item_code" in st.session_state:
+                st.session_state.sell_lookup_code = st.session_state.prefill_sell_item_code
+                st.session_state.sell_selected_item_code = st.session_state.prefill_sell_item_code
+                del st.session_state.prefill_sell_item_code
+
+            st.markdown(
+                """
+                <div class="workflow-panel">
+                    <div class="workflow-kicker">Step 1</div>
+                    <div class="workflow-title">Find Item to Sell</div>
+                    <div class="workflow-text">Enter the item code, then confirm how many units were sold from your available stock.</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            with st.form("sell_item_lookup_form"):
+                sell_lookup_code = st.text_input(
+                    "Item Code",
+                    key="sell_lookup_code",
+                    placeholder="Enter item code, for example 123"
+                )
+                sell_lookup_submitted = st.form_submit_button(
+                    "View Sale Details",
+                    type="primary",
+                    width="stretch"
+                )
+
+            if sell_lookup_submitted:
+                st.session_state.sell_selected_item_code = sell_lookup_code.strip()
+
+            sell_item_code = st.session_state.get("sell_selected_item_code", "").strip()
+
+        with sell_detail_col:
+            st.markdown('<div class="dashboard-section-title">Record Sale</div>', unsafe_allow_html=True)
+
+            if not sell_item_code:
+                st.info("Enter an item code on the left to load your available quantity.")
+
+        if sell_item_code:
+            conn = get_connection()
+            c = conn.cursor()
+            c.execute(
+                "SELECT * FROM inventory WHERE item_code=?",
+                (sell_item_code,)
+            )
+            item = c.fetchone()
+            c.execute(
+                '''
+                SELECT quantity FROM user_inventory
+                WHERE username=? AND item_code=?
+                ''',
+                (st.session_state.username, sell_item_code)
+            )
+            user_inventory_row = c.fetchone()
+            conn.close()
+
+            if item:
+                system_quantity = int(item[4])
+                user_quantity = int(user_inventory_row[0]) if user_inventory_row else 0
+                item_name_safe = safe_html(item[2])
+                item_description_safe = safe_html(item[3])
+                status_class = "low" if user_quantity <= 5 else "ok"
+                status_text = "Low user stock" if user_quantity <= 5 else "Ready to sell"
+
+                with sell_detail_col:
+                    st.markdown(
+                        f"""
+                        <div class="item-card">
+                            <div class="item-status {status_class}">{status_text}</div>
+                            <div class="item-name">{item_name_safe}</div>
+                            <div class="item-meta">{item_description_safe}</div>
+                            <div class="quantity-pill">
+                                <div class="quantity-pill-label">MY QUANTITY AVAILABLE</div>
+                                <div class="quantity-pill-value">{user_quantity}</div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    quantity_sold = st.number_input(
+                        "Quantity Sold",
+                        min_value=1,
+                        step=1,
+                        key="sell_quantity_sold"
+                    )
+
+                    quantity_after_preview = max(user_quantity - int(quantity_sold), 0)
+
+                    st.markdown(
+                        f"""
+                        <div class="content-panel">
+                            <div class="workflow-kicker">Sale Preview</div>
+                            <div class="action-summary-grid">
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">System Qty</div>
+                                    <div class="action-summary-value">{system_quantity}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">My Qty Before</div>
+                                    <div class="action-summary-value">{user_quantity}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">Sold</div>
+                                    <div class="action-summary-value">{int(quantity_sold)}</div>
+                                </div>
+                                <div class="action-summary-card">
+                                    <div class="action-summary-label">My Qty After</div>
+                                    <div class="action-summary-value">{quantity_after_preview}</div>
+                                </div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    if st.button("Save Sale", type="primary", width="stretch"):
+                        sale_conn = get_connection()
+                        sale_c = sale_conn.cursor()
+
+                        try:
+                            sale_c.execute("BEGIN IMMEDIATE")
+                            sale_c.execute(
+                                '''
+                                SELECT quantity FROM user_inventory
+                                WHERE username=? AND item_code=?
+                                ''',
+                                (st.session_state.username, sell_item_code)
+                            )
+                            current_user_item = sale_c.fetchone()
+
+                            sale_c.execute(
+                                "SELECT id, item_name, quantity FROM inventory WHERE item_code=?",
+                                (sell_item_code,)
+                            )
+                            current_item = sale_c.fetchone()
+
+                            if not current_item:
+                                sale_conn.rollback()
+                                st.error("Item not found. Check the item code and try again.")
+                            else:
+                                quantity_before = int(current_user_item[0]) if current_user_item else 0
+                                quantity_sold_int = int(quantity_sold)
+
+                                if quantity_sold_int > quantity_before:
+                                    sale_conn.rollback()
+                                    st.error("Not enough quantity in your stock. Add stock from Scan Inventory first.")
+                                else:
+                                    quantity_after = quantity_before - quantity_sold_int
+
+                                    sale_c.execute(
+                                        '''
+                                        UPDATE user_inventory
+                                        SET quantity=?
+                                        WHERE username=? AND item_code=?
+                                        ''',
+                                        (quantity_after, st.session_state.username, sell_item_code)
+                                    )
+
+                                    sale_c.execute(
+                                        '''
+                                        INSERT INTO transactions
+                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
+                                        VALUES (?,?,?,?,?,?,?)
+                                        ''',
+                                        (
+                                            st.session_state.username,
+                                            sell_item_code,
+                                            quantity_sold_int,
+                                            quantity_before,
+                                            quantity_after,
+                                            "sale",
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        )
+                                    )
+
+                                    sale_conn.commit()
+                                    st.session_state.sell_item_message = (
+                                        f"Sale saved successfully. Sold {quantity_sold_int} unit(s). Remaining quantity is {quantity_after}."
+                                    )
+                                    st.rerun()
+
+                        finally:
+                            sale_conn.close()
+
+            else:
+                with sell_detail_col:
+                    st.error("Item not found. Check the item code and try again.")
+
     if menu == "Transaction Logs":
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
 
         df = pd.read_sql_query(
             "SELECT * FROM transactions ORDER BY id DESC",
@@ -3069,6 +3567,9 @@ else:
         )
 
         conn.close()
+
+        if st.session_state.role != "admin" and not df.empty:
+            df = df[df["username"] == st.session_state.username].copy()
 
         st.markdown(
             """
@@ -3081,8 +3582,14 @@ else:
             unsafe_allow_html=True
         )
 
+        if not df.empty:
+            df["transaction_type"] = df["transaction_type"].fillna("legacy")
+            df["quantity_before"] = df["quantity_before"].fillna(0).astype(int)
+            df["quantity_after"] = df["quantity_after"].fillna(0).astype(int)
+
         total_logs = len(df)
-        total_used = int(df["quantity_used"].sum()) if not df.empty else 0
+        total_allocated = int(df.loc[df["transaction_type"] == "allocation", "quantity_used"].sum()) if not df.empty else 0
+        total_sold = int(df.loc[df["transaction_type"] == "sale", "quantity_used"].sum()) if not df.empty else 0
         unique_items_used = df["item_code"].nunique() if not df.empty else 0
         active_users = df["username"].nunique() if not df.empty else 0
 
@@ -3104,9 +3611,9 @@ else:
             st.markdown(
                 f"""
                 <div class="dashboard-card">
-                    <div class="dashboard-card-label">Quantity Used</div>
-                    <div class="dashboard-card-value">{total_used}</div>
-                    <div class="dashboard-card-note">Total units consumed</div>
+                    <div class="dashboard-card-label">Quantity Sold</div>
+                    <div class="dashboard-card-value">{total_sold}</div>
+                    <div class="dashboard-card-note">Units sold from user stock</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -3116,9 +3623,9 @@ else:
             st.markdown(
                 f"""
                 <div class="dashboard-card">
-                    <div class="dashboard-card-label">Items Used</div>
-                    <div class="dashboard-card-value">{unique_items_used}</div>
-                    <div class="dashboard-card-note">Unique item codes</div>
+                    <div class="dashboard-card-label">Quantity Allocated</div>
+                    <div class="dashboard-card-value">{total_allocated}</div>
+                    <div class="dashboard-card-note">Units added to user stock</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -3159,6 +3666,25 @@ else:
                     | display_df["item_code"].str.lower().str.contains(search_term, na=False)
                 ]
 
+            display_df = display_df.copy()
+            display_df["transaction_type"] = display_df["transaction_type"].replace({
+                "allocation": "Added to My Stock",
+                "sale": "Sold Item",
+                "legacy": "Legacy Record",
+            })
+            display_df = display_df[
+                [
+                    "id",
+                    "username",
+                    "item_code",
+                    "transaction_type",
+                    "quantity_before",
+                    "quantity_used",
+                    "quantity_after",
+                    "transaction_time",
+                ]
+            ]
+
             st.dataframe(
                 display_df,
                 width="stretch",
@@ -3167,7 +3693,10 @@ else:
                     "id": "ID",
                     "username": "User",
                     "item_code": "Item Code",
-                    "quantity_used": "Quantity Used",
+                    "transaction_type": "Action",
+                    "quantity_before": "My Qty Before",
+                    "quantity_used": "Quantity Changed",
+                    "quantity_after": "My Qty After",
                     "transaction_time": "Transaction Time",
                 }
             )
