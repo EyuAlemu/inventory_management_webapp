@@ -3651,102 +3651,155 @@ else:
                     f"{row['name']} (ID {row['id']})": int(row["id"])
                     for _, row in locations_df.iterrows()
                 }
-                item_options = {
-                    f"{row['item_name']} ({row['item_code']})": row["item_code"]
-                    for _, row in inventory_df.iterrows()
-                }
 
-                with st.form("create_invoice_form"):
-                    invoice_location = st.selectbox("Location", list(location_options.keys()), key="invoice_location")
-                    customer_name = st.text_input("Customer / Company Name")
-                    invoice_item = st.selectbox("Item", list(item_options.keys()), key="invoice_item")
-                    invoice_quantity = st.number_input("Quantity", min_value=1, step=1, key="invoice_quantity")
-                    invoice_unit_price = st.number_input("Unit Price", min_value=0.0, step=0.01, format="%.2f")
-                    create_invoice = st.form_submit_button("Create Invoice", type="primary", width="stretch")
+                invoice_location = st.selectbox(
+                    "Location",
+                    list(location_options.keys()),
+                    key="invoice_location_selector"
+                )
+                location_id = location_options[invoice_location]
 
-                if create_invoice:
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    location_id = location_options[invoice_location]
+                conn = get_connection()
+                available_items_df = pd.read_sql_query(
+                    '''
+                    SELECT li.item_code, i.item_name, li.quantity, COALESCE(lp.price, 0) AS price
+                    FROM location_inventory li
+                    LEFT JOIN inventory i ON li.item_code = i.item_code
+                    LEFT JOIN location_prices lp
+                        ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+                    WHERE li.location_id=? AND li.quantity > 0
+                    ORDER BY i.item_name
+                    ''',
+                    conn,
+                    params=(location_id,)
+                )
+                conn.close()
+
+                allowed_item_codes = set(inventory_df["item_code"].astype(str).tolist())
+                location_has_stock = not available_items_df.empty
+                available_items_df = available_items_df[
+                    available_items_df["item_code"].astype(str).isin(allowed_item_codes)
+                ].copy()
+
+                if available_items_df.empty:
+                    if not location_has_stock:
+                        st.info("The selected location has no available stock yet. Add stock in Location Inventory or choose another location.")
+                    elif not is_super_admin():
+                        st.info("This location has stock, but none of the stocked items are assigned to this admin as supplied products. Ruth can assign the product in User Management, or you can choose another location.")
+                    else:
+                        st.info("The selected location has stock, but none of the stocked items match the current invoice product list. Check Location Inventory and the master inventory list.")
+                else:
+                    item_options = {
+                        f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available - ${float(row['price']):.2f}":
+                        row["item_code"]
+                        for _, row in available_items_df.iterrows()
+                    }
+                    invoice_item = st.selectbox(
+                        "Item",
+                        list(item_options.keys()),
+                        key=f"invoice_item_selector_{location_id}"
+                    )
                     item_code = item_options[invoice_item]
-                    quantity_int = int(invoice_quantity)
-                    conn = get_connection()
-                    c = conn.cursor()
+                    selected_item_row = available_items_df[
+                        available_items_df["item_code"] == item_code
+                    ].iloc[0]
+                    available_quantity = int(selected_item_row["quantity"])
+                    default_unit_price = float(selected_item_row["price"])
+                    create_invoice = False
 
-                    try:
-                        c.execute("BEGIN IMMEDIATE")
-                        c.execute(
-                            '''
-                            SELECT quantity FROM location_inventory
-                            WHERE location_id=? AND item_code=?
-                            ''',
-                            (location_id, item_code)
+                    with st.form(f"create_invoice_form_{location_id}_{item_code}"):
+                        st.caption(
+                            f"Available at this location: {available_quantity} unit(s). "
+                            f"Default location price: ${default_unit_price:.2f}."
                         )
-                        stock_row = c.fetchone()
-                        available_quantity = int(stock_row[0]) if stock_row else 0
+                        customer_name = st.text_input("Customer / Company Name")
+                        invoice_quantity = st.number_input(
+                            "Quantity",
+                            min_value=1,
+                            max_value=max(available_quantity, 1),
+                            step=1,
+                            key=f"invoice_quantity_{location_id}_{item_code}"
+                        )
+                        invoice_unit_price = st.number_input(
+                            "Unit Price",
+                            min_value=0.0,
+                            value=default_unit_price,
+                            step=0.01,
+                            format="%.2f",
+                            key=f"invoice_unit_price_{location_id}_{item_code}"
+                        )
+                        create_invoice = st.form_submit_button("Create Invoice", type="primary", width="stretch")
 
-                        if quantity_int > available_quantity:
-                            conn.rollback()
-                            st.error("Not enough stock is available at the selected location to create this invoice.")
-                        else:
+                    if create_invoice:
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        quantity_int = int(invoice_quantity)
+                        conn = get_connection()
+                        c = conn.cursor()
+
+                        try:
+                            c.execute("BEGIN IMMEDIATE")
                             c.execute(
                                 '''
-                                SELECT price FROM location_prices
+                                SELECT quantity FROM location_inventory
                                 WHERE location_id=? AND item_code=?
                                 ''',
                                 (location_id, item_code)
                             )
-                            price_row = c.fetchone()
-                            unit_price = float(invoice_unit_price)
-                            if unit_price == 0 and price_row:
-                                unit_price = float(price_row[0])
+                            stock_row = c.fetchone()
+                            current_available_quantity = int(stock_row[0]) if stock_row else 0
 
-                            invoice_total = quantity_int * unit_price
-                            c.execute(
-                                '''
-                                UPDATE location_inventory
-                                SET quantity=?
-                                WHERE location_id=? AND item_code=?
-                                ''',
-                                (available_quantity - quantity_int, location_id, item_code)
-                            )
-                            c.execute(
-                                '''
-                                INSERT INTO invoices
-                                (location_id,customer_name,created_by,subtotal,total,status,created_at)
-                                VALUES (?,?,?,?,?,?,?)
-                                ''',
-                                (
-                                    location_id,
-                                    customer_name.strip(),
-                                    st.session_state.username,
-                                    invoice_total,
-                                    invoice_total,
-                                    "open",
-                                    now
+                            if quantity_int > current_available_quantity:
+                                conn.rollback()
+                                st.error("Not enough stock is available at the selected location to create this invoice.")
+                            else:
+                                unit_price = float(invoice_unit_price)
+                                invoice_total = quantity_int * unit_price
+                                c.execute(
+                                    '''
+                                    UPDATE location_inventory
+                                    SET quantity=?
+                                    WHERE location_id=? AND item_code=?
+                                    ''',
+                                    (current_available_quantity - quantity_int, location_id, item_code)
                                 )
-                            )
-                            invoice_id = c.lastrowid
-                            invoice_number = f"INV-{invoice_id:05d}"
-                            c.execute("UPDATE invoices SET invoice_number=? WHERE id=?", (invoice_number, invoice_id))
-                            c.execute(
-                                '''
-                                INSERT INTO invoice_items
-                                (invoice_id,item_code,quantity,unit_price,line_total)
-                                VALUES (?,?,?,?,?)
-                                ''',
-                                (
-                                    invoice_id,
-                                    item_code,
-                                    quantity_int,
-                                    unit_price,
-                                    invoice_total
+                                c.execute(
+                                    '''
+                                    INSERT INTO invoices
+                                    (location_id,customer_name,created_by,subtotal,total,status,created_at)
+                                    VALUES (?,?,?,?,?,?,?)
+                                    ''',
+                                    (
+                                        location_id,
+                                        customer_name.strip(),
+                                        st.session_state.username,
+                                        invoice_total,
+                                        invoice_total,
+                                        "open",
+                                        now
+                                    )
                                 )
-                            )
-                            conn.commit()
-                            st.success(f"Invoice {invoice_number} created successfully. Location inventory was reduced automatically.")
-                            st.rerun()
-                    finally:
-                        conn.close()
+                                invoice_id = c.lastrowid
+                                invoice_number = f"INV-{invoice_id:05d}"
+                                c.execute("UPDATE invoices SET invoice_number=? WHERE id=?", (invoice_number, invoice_id))
+                                c.execute(
+                                    '''
+                                    INSERT INTO invoice_items
+                                    (invoice_id,item_code,quantity,unit_price,line_total)
+                                    VALUES (?,?,?,?,?)
+                                    ''',
+                                    (
+                                        invoice_id,
+                                        item_code,
+                                        quantity_int,
+                                        unit_price,
+                                        invoice_total
+                                    )
+                                )
+                                conn.commit()
+                                st.success(f"Invoice {invoice_number} created successfully. Location inventory was reduced automatically.")
+                                st.rerun()
+                        finally:
+                            conn.close()
 
         with payment_form_col:
             st.markdown('<div class="dashboard-section-title">Record Payment</div>', unsafe_allow_html=True)
