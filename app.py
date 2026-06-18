@@ -5,7 +5,8 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 
-from auth import SUPER_ADMIN_USERNAME, add_default_admin, hash_password, login, normalize_role
+import auth
+from auth import add_default_admin, hash_password, login
 from db import get_connection, init_db
 from utils import decode_qr_from_image, generate_qr, image_to_base64, safe_html
 
@@ -14,8 +15,23 @@ add_default_admin()
 
 st.set_page_config(page_title="Inventory Management", layout="wide")
 
+SUPER_ADMIN_USERNAME = getattr(auth, "SUPER_ADMIN_USERNAME", "Ruth")
 ADMIN_ROLES = {"super_admin", "admin"}
 STANDARD_WORKFLOW_ROLES = {"user", "sales"}
+
+
+def normalize_role(username, role):
+    if hasattr(auth, "normalize_role"):
+        return auth.normalize_role(username, role)
+
+    valid_roles = {"super_admin", "admin", "sales", "user"}
+    if role not in valid_roles:
+        return "user"
+
+    if role == "super_admin" and username.strip().lower() != SUPER_ADMIN_USERNAME.lower():
+        return "admin"
+
+    return role
 
 
 def get_current_role():
