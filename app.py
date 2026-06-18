@@ -5,7 +5,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 
-from auth import add_default_admin, hash_password, login
+from auth import SUPER_ADMIN_USERNAME, add_default_admin, hash_password, login, normalize_role
 from db import get_connection, init_db
 from utils import decode_qr_from_image, generate_qr, image_to_base64, safe_html
 
@@ -13,6 +13,64 @@ init_db()
 add_default_admin()
 
 st.set_page_config(page_title="Inventory Management", layout="wide")
+
+ADMIN_ROLES = {"super_admin", "admin"}
+STANDARD_WORKFLOW_ROLES = {"user", "sales"}
+
+
+def get_current_role():
+    return normalize_role(
+        st.session_state.get("username", ""),
+        st.session_state.get("role", "user")
+    )
+
+
+def has_admin_access():
+    return get_current_role() in ADMIN_ROLES
+
+
+def is_super_admin():
+    return get_current_role() == "super_admin"
+
+
+def get_assigned_location_ids(username=None):
+    username = username or st.session_state.get("username", "")
+
+    if not username:
+        return []
+
+    conn = get_connection()
+    assigned_df = pd.read_sql_query(
+        "SELECT location_id FROM user_locations WHERE username=?",
+        conn,
+        params=(username,)
+    )
+    conn.close()
+
+    if assigned_df.empty:
+        return []
+
+    return assigned_df["location_id"].astype(int).tolist()
+
+
+def get_supplied_item_codes(username=None):
+    username = username or st.session_state.get("username", "")
+
+    if not username:
+        return []
+
+    conn = get_connection()
+    supplied_df = pd.read_sql_query(
+        "SELECT item_code FROM product_suppliers WHERE username=?",
+        conn,
+        params=(username,)
+    )
+    conn.close()
+
+    if supplied_df.empty:
+        return []
+
+    return supplied_df["item_code"].astype(str).tolist()
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -162,12 +220,13 @@ if not st.session_state.logged_in:
             st.session_state.username = user[1]
             st.session_state.role = user[3]
             st.session_state.menu = "Dashboard"
-            st.success("Login successful")
+            st.success("Login successful. Loading your role-based dashboard now.")
             st.rerun()
         else:
-            st.error("Invalid credentials")
+            st.error("Invalid username or password. Check the account details and try again.")
 
 else:
+    st.session_state.role = get_current_role()
 
     st.markdown(
         """
@@ -1587,18 +1646,48 @@ else:
 
     menu_icons["Manage Sales"] = "$"
     menu_icons["Sell Item"] = "$"
+    menu_icons["Locations"] = "LOC"
+    menu_icons["Location Inventory"] = "STK"
+    menu_icons["Financials"] = "FIN"
+    menu_icons["Returns"] = "RET"
+    menu_icons["Transfers"] = "TRN"
 
-    if st.session_state.role == "admin":
+    if has_admin_access():
         main_items = ["Dashboard", "Transaction Logs"]
+    elif get_current_role() == "sales":
+        main_items = ["Dashboard", "Sell Item", "Returns", "Transaction Logs"]
     else:
         main_items = ["Dashboard", "Scan Inventory", "Scan QR / Barcode", "Sell Item", "Transaction Logs"]
 
-    admin_items = ["Add Inventory", "View Inventory", "Print QR Codes", "Manage Sales", "User Management"] if st.session_state.role == "admin" else []
+    admin_items = (
+        [
+            "Location Inventory",
+            "Financials",
+            "Returns",
+            "Transfers",
+        ]
+        if has_admin_access()
+        else []
+    )
+
+    if is_super_admin():
+        admin_items = [
+            "Add Inventory",
+            "View Inventory",
+            "Print QR Codes",
+            "Manage Sales",
+            "User Management",
+            "Locations",
+            "Location Inventory",
+            "Financials",
+            "Returns",
+            "Transfers",
+        ]
 
     allowed_items = main_items + admin_items + ["Logout"]
 
     if st.session_state.menu not in allowed_items:
-        st.session_state.menu = "Dashboard" if st.session_state.role == "admin" else "Scan Inventory"
+        st.session_state.menu = "Dashboard" if has_admin_access() else "Scan Inventory"
 
     st.sidebar.markdown(
         '<div class="sidebar-section-label">Main</div>',
@@ -1649,7 +1738,7 @@ else:
 
     menu = st.session_state.menu
 
-    if menu == "Dashboard" and st.session_state.role != "admin":
+    if menu == "Dashboard" and not has_admin_access():
         username_safe = safe_html(st.session_state.username)
         conn = get_connection()
         user_transactions_df = pd.read_sql_query(
@@ -1825,7 +1914,7 @@ else:
             with st.container(border=True):
                 st.markdown('<div class="admin-panel-title">My Current Stock</div>', unsafe_allow_html=True)
                 if user_stock_df.empty:
-                    st.info("No items assigned yet.")
+                    st.info("No stock is assigned to your account yet. Ask an admin to allocate inventory before selling items.")
                 else:
                     stock_display_df = user_stock_df.rename(
                         columns={
@@ -1840,7 +1929,7 @@ else:
             with st.container(border=True):
                 st.markdown('<div class="admin-panel-title">Recent Activity</div>', unsafe_allow_html=True)
                 if user_transactions_df.empty:
-                    st.info("No activity yet.")
+                    st.info("No activity has been recorded for your account yet. Your allocations and sales will appear here.")
                 else:
                     recent_user_df = user_transactions_df.head(5)[
                         ["item_code", "transaction_type", "quantity_used", "quantity_after", "transaction_time"]
@@ -1861,7 +1950,7 @@ else:
                     )
                     st.dataframe(recent_user_df, width="stretch", hide_index=True)
 
-    if menu == "Dashboard" and st.session_state.role == "admin":
+    if menu == "Dashboard" and has_admin_access():
 
         conn = get_connection()
 
@@ -1880,15 +1969,75 @@ else:
             conn
         )
 
+        location_inventory_df = pd.read_sql_query(
+            '''
+            SELECT li.location_id, li.item_code, i.item_name, li.quantity
+            FROM location_inventory li
+            LEFT JOIN inventory i ON li.item_code = i.item_code
+            ''',
+            conn
+        )
+
+        invoice_activity_df = pd.read_sql_query(
+            '''
+            SELECT inv.id, inv.location_id, inv.created_by AS username, ii.item_code,
+                   ii.quantity AS quantity_used, inv.created_at AS transaction_time
+            FROM invoices inv
+            LEFT JOIN invoice_items ii ON ii.invoice_id = inv.id
+            ORDER BY inv.id DESC
+            ''',
+            conn
+        )
+
         conn.close()
+
+        if not is_super_admin():
+            assigned_location_ids = get_assigned_location_ids()
+            supplied_item_codes = set(get_supplied_item_codes())
+
+            location_inventory_df = location_inventory_df[
+                location_inventory_df["location_id"].isin(assigned_location_ids)
+            ].copy()
+            invoice_activity_df = invoice_activity_df[
+                invoice_activity_df["location_id"].isin(assigned_location_ids)
+            ].copy()
+
+            if supplied_item_codes:
+                location_inventory_df = location_inventory_df[
+                    location_inventory_df["item_code"].isin(supplied_item_codes)
+                ].copy()
+                invoice_activity_df = invoice_activity_df[
+                    invoice_activity_df["item_code"].isin(supplied_item_codes)
+                ].copy()
+            else:
+                location_inventory_df = location_inventory_df.iloc[0:0].copy()
+                invoice_activity_df = invoice_activity_df.iloc[0:0].copy()
+
+            if location_inventory_df.empty:
+                inventory_df = inventory_df.iloc[0:0].copy()
+            else:
+                inventory_df = (
+                    location_inventory_df.groupby(["item_code", "item_name"], as_index=False)["quantity"]
+                    .sum()
+                )
+
+            trans_df = invoice_activity_df.rename(columns={"id": "invoice_id"}).copy()
+            if not trans_df.empty:
+                trans_df["id"] = trans_df["invoice_id"]
+                trans_df["transaction_type"] = "sale"
+                trans_df["quantity_before"] = None
+                trans_df["quantity_after"] = None
+            total_users = 1
+        else:
+            total_users = len(users_df)
 
         total_items = len(inventory_df)
         total_stock = int(inventory_df["quantity"].sum()) if not inventory_df.empty else 0
         low_stock = int((inventory_df["quantity"] <= 5).sum()) if not inventory_df.empty else 0
         total_transactions = len(trans_df)
-        total_users = len(users_df)
         total_used = int(trans_df["quantity_used"].sum()) if not trans_df.empty else 0
         username_safe = safe_html(st.session_state.username)
+        role_label = "Super Admin" if is_super_admin() else "Admin"
 
         st.markdown(
             f"""
@@ -1900,8 +2049,8 @@ else:
                 <div class="admin-profile-pill">
                     <div class="admin-profile-avatar">A</div>
                     <div>
-                        <div class="admin-profile-name">Admin</div>
-                        <div class="admin-profile-role">Super Admin</div>
+                        <div class="admin-profile-name">{username_safe}</div>
+                        <div class="admin-profile-role">{role_label}</div>
                     </div>
                 </div>
             </div>
@@ -2095,14 +2244,14 @@ else:
                 st.markdown('<div class="admin-panel-title">Low Stock Items</div>', unsafe_allow_html=True)
 
                 if inventory_df.empty:
-                    st.info("No inventory items yet.")
+                    st.info("No inventory records are available for this view yet.")
                 else:
                     low_stock_df = inventory_df[inventory_df["quantity"] <= 5][
                         ["item_code", "item_name", "quantity"]
                     ].sort_values("quantity")
 
                     if low_stock_df.empty:
-                        st.success("All items have healthy stock levels.")
+                        st.success("All visible items are above the low-stock threshold.")
                     else:
                         st.dataframe(low_stock_df, width="stretch", hide_index=True)
 
@@ -2111,7 +2260,7 @@ else:
                 st.markdown('<div class="admin-panel-title">Recent Transactions</div>', unsafe_allow_html=True)
 
                 if trans_df.empty:
-                    st.info("No transactions recorded yet.")
+                    st.info("No operational activity has been recorded for this view yet.")
                 else:
                     recent_trans_df = trans_df.sort_values("id", ascending=False).head(5)[
                         ["username", "item_code", "quantity_used", "transaction_time"]
@@ -2123,7 +2272,7 @@ else:
                 st.markdown('<div class="admin-panel-title">Inventory Status</div>', unsafe_allow_html=True)
 
                 if inventory_df.empty:
-                    st.info("No inventory items yet.")
+                    st.info("No inventory records are available for this view yet.")
                 else:
                     max_quantity = max(int(inventory_df["quantity"].max()), 1)
                     status_rows = []
@@ -2184,7 +2333,7 @@ else:
             unsafe_allow_html=True
         )
 
-    if st.session_state.role == "admin":
+    if has_admin_access():
 
         if menu == "Add Inventory":
 
@@ -2250,7 +2399,7 @@ else:
             if save_inventory:
 
                 if not item_code.strip() or not item_name.strip():
-                    st.error("Item code and item name are required.")
+                    st.error("Item code and item name are required before inventory can be saved.")
                 else:
                     conn = get_connection()
                     c = conn.cursor()
@@ -2268,11 +2417,11 @@ else:
                         conn.commit()
                         qr_path = generate_qr(item_code.strip())
 
-                        st.success("Inventory added successfully.")
+                        st.success("Inventory item created successfully. A QR code was generated for this item.")
                         st.image(qr_path, caption=f"QR Code: {item_code.strip()}", width=180)
 
                     except sqlite3.IntegrityError:
-                        st.error("An item with this code already exists.")
+                        st.error("This item code already exists. Use a unique code or edit the existing item.")
 
                     finally:
                         conn.close()
@@ -2347,7 +2496,7 @@ else:
             )
 
             if df.empty:
-                st.info("No inventory items found.")
+                st.info("No inventory items match the current view or search.")
             else:
                 search_term = st.text_input(
                     "Search inventory",
@@ -2464,7 +2613,7 @@ else:
 
                         if update_item:
                             if not edit_item_code.strip() or not edit_item_name.strip():
-                                st.error("Item code and item name are required.")
+                                st.error("Item code and item name are required before updating this inventory record.")
                             else:
                                 old_item_code = str(selected_item["item_code"])
                                 new_item_code = edit_item_code.strip()
@@ -2520,13 +2669,13 @@ else:
                                         )
 
                                     conn.commit()
-                                    st.session_state.inventory_message = "Inventory updated successfully."
+                                    st.session_state.inventory_message = "Inventory record updated successfully. Related user stock and transaction item codes were synchronized when needed."
                                     st.session_state.manage_inventory_id = None
                                     st.rerun()
 
                                 except sqlite3.IntegrityError:
                                     conn.rollback()
-                                    st.error("Another item already uses this item code.")
+                                    st.error("Another inventory item already uses this code. Choose a unique item code.")
 
                                 finally:
                                     conn.close()
@@ -2567,7 +2716,7 @@ else:
                             conn.commit()
                             conn.close()
                             st.session_state.manage_inventory_id = None
-                            st.session_state.inventory_message = "Inventory item deleted successfully."
+                            st.session_state.inventory_message = "Inventory item deleted successfully. Existing transaction history was preserved."
                             st.rerun()
 
         if menu == "Print QR Codes":
@@ -2593,7 +2742,7 @@ else:
             )
 
             if df.empty:
-                st.info("No inventory items found. Add inventory before printing QR labels.")
+                st.info("No inventory items are available for QR labels. Add inventory first, then return to print labels.")
             else:
                 item_options = [str(row["item_code"]) for _, row in df.iterrows()]
                 item_labels = {
@@ -2618,7 +2767,7 @@ else:
                 st.markdown('<div class="dashboard-section-title">Printable Labels</div>', unsafe_allow_html=True)
 
                 if selected_df.empty:
-                    st.info("Select at least one inventory item to preview QR labels.")
+                    st.info("Select one or more inventory items to preview printable QR labels.")
                 else:
                     label_cards = []
 
@@ -2710,7 +2859,7 @@ else:
                         scrolling=True
                     )
 
-        if menu == "User Management":
+        if menu == "User Management" and is_super_admin():
 
             conn = get_connection()
 
@@ -2733,8 +2882,10 @@ else:
             )
 
             total_users = len(users_df)
+            super_admin_count = int((users_df["role"] == "super_admin").sum()) if not users_df.empty else 0
             admin_count = int((users_df["role"] == "admin").sum()) if not users_df.empty else 0
-            staff_count = total_users - admin_count
+            sales_count = int((users_df["role"] == "sales").sum()) if not users_df.empty else 0
+            user_count = int((users_df["role"] == "user").sum()) if not users_df.empty else 0
 
             user_col1, user_col2, user_col3 = st.columns(3)
 
@@ -2756,7 +2907,7 @@ else:
                     <div class="dashboard-card">
                         <div class="dashboard-card-label">Admins</div>
                         <div class="dashboard-card-value">{admin_count}</div>
-                        <div class="dashboard-card-note">Full access accounts</div>
+                        <div class="dashboard-card-note">{super_admin_count} super admin</div>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -2766,9 +2917,9 @@ else:
                 st.markdown(
                     f"""
                     <div class="dashboard-card">
-                        <div class="dashboard-card-label">Standard Users</div>
-                        <div class="dashboard-card-value">{staff_count}</div>
-                        <div class="dashboard-card-note">Inventory usage access</div>
+                        <div class="dashboard-card-label">Sales / Users</div>
+                        <div class="dashboard-card-value">{sales_count + user_count}</div>
+                        <div class="dashboard-card-note">{sales_count} sales, {user_count} users</div>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -2782,7 +2933,10 @@ else:
                 with st.form("create_user_form"):
                     new_username = st.text_input("Username", key="new_username")
                     new_password = st.text_input("Password", type="password", key="new_password")
-                    new_role = st.selectbox("Role", ["user", "admin"], key="new_role")
+                    role_options = ["user", "sales", "admin"]
+                    if is_super_admin():
+                        role_options.append("super_admin")
+                    new_role = st.selectbox("Role", role_options, key="new_role")
 
                     create_user = st.form_submit_button(
                         "Create User",
@@ -2791,8 +2945,14 @@ else:
                     )
 
                 if create_user:
-                    if not new_username.strip() or not new_password.strip():
-                        st.error("Username and password are required.")
+                    new_username_clean = new_username.strip()
+                    new_password_clean = new_password.strip()
+                    normalized_new_role = normalize_role(new_username_clean, new_role)
+
+                    if not new_username_clean or not new_password_clean:
+                        st.error("Username and password are required before a new user can be created.")
+                    elif new_role == "super_admin" and normalized_new_role != "super_admin":
+                        st.error(f"Only the {SUPER_ADMIN_USERNAME} account can be assigned the super admin role.")
                     else:
                         conn = get_connection()
                         c = conn.cursor()
@@ -2800,14 +2960,14 @@ else:
                         try:
                             c.execute(
                                 "INSERT INTO users (username,password,role) VALUES (?,?,?)",
-                                (new_username.strip(), hash_password(new_password.strip()), new_role)
+                                (new_username_clean, hash_password(new_password_clean), normalized_new_role)
                             )
                             conn.commit()
-                            st.success("User created successfully.")
+                            st.success("User account created successfully with the selected role.")
                             st.rerun()
 
                         except sqlite3.IntegrityError:
-                            st.error("A user with this username already exists.")
+                            st.error("A user with this username already exists. Choose a different username.")
 
                         finally:
                             conn.close()
@@ -2816,7 +2976,7 @@ else:
                 st.markdown('<div class="dashboard-section-title">Existing Users</div>', unsafe_allow_html=True)
 
                 if users_df.empty:
-                    st.info("No user accounts found.")
+                    st.info("No user accounts are available to manage yet.")
                 else:
                     st.dataframe(
                         users_df,
@@ -2830,11 +2990,12 @@ else:
                     )
 
                     removable_users = users_df[
-                        users_df["username"] != st.session_state.username
+                        (users_df["username"] != st.session_state.username)
+                        & (users_df["username"].str.lower() != SUPER_ADMIN_USERNAME.lower())
                     ]
 
                     if removable_users.empty:
-                        st.info("You cannot delete the account you are currently using.")
+                        st.info("There are no removable users. You cannot delete the account you are currently using or Ruth's super admin account.")
                     else:
                         user_to_delete = st.selectbox(
                             "Delete User",
@@ -2850,15 +3011,1117 @@ else:
                                 (user_to_delete,)
                             )
                             c.execute(
+                                "DELETE FROM user_locations WHERE username=?",
+                                (user_to_delete,)
+                            )
+                            c.execute(
+                                "DELETE FROM product_suppliers WHERE username=?",
+                                (user_to_delete,)
+                            )
+                            c.execute(
                                 "DELETE FROM users WHERE username=?",
                                 (user_to_delete,)
                             )
                             conn.commit()
                             conn.close()
-                            st.success("User deleted successfully.")
+                            st.success("User account deleted successfully, including related location and supplier assignments.")
                             st.rerun()
 
-    if menu == "Manage Sales":
+            conn = get_connection()
+            inventory_df = pd.read_sql_query(
+                "SELECT item_code, item_name FROM inventory ORDER BY item_name",
+                conn
+            )
+            product_assignments_df = pd.read_sql_query(
+                '''
+                SELECT ps.id, ps.username, i.item_code, i.item_name
+                FROM product_suppliers ps
+                LEFT JOIN inventory i ON ps.item_code = i.item_code
+                ORDER BY ps.username, i.item_name
+                ''',
+                conn
+            )
+            conn.close()
+
+            st.markdown("---")
+            st.markdown('<div class="dashboard-section-title">Assign Supplied Products</div>', unsafe_allow_html=True)
+
+            supplier_admins_df = users_df[users_df["role"] == "admin"].copy()
+
+            if supplier_admins_df.empty or inventory_df.empty:
+                st.info("Create at least one admin account and one inventory item before assigning supplied products.")
+            else:
+                supplier_col, supplier_table_col = st.columns([0.9, 1.1])
+
+                with supplier_col:
+                    supplier_username = st.selectbox(
+                        "Admin / Supplier",
+                        supplier_admins_df["username"].tolist(),
+                        key="supplier_assignment_user"
+                    )
+                    supplier_item_options = {
+                        f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                        for _, row in inventory_df.iterrows()
+                    }
+                    supplier_item = st.selectbox(
+                        "Supplied Product",
+                        list(supplier_item_options.keys()),
+                        key="supplier_assignment_item"
+                    )
+
+                    supplier_assign_col, supplier_remove_col = st.columns(2)
+
+                    with supplier_assign_col:
+                        if st.button("Assign Product", type="primary", width="stretch"):
+                            conn = get_connection()
+                            c = conn.cursor()
+
+                            try:
+                                c.execute(
+                                    '''
+                                    INSERT INTO product_suppliers (username,item_code)
+                                    VALUES (?,?)
+                                    ''',
+                                    (supplier_username, supplier_item_options[supplier_item])
+                                )
+                                conn.commit()
+                                st.success("Supplied product assignment saved. This admin can now see financial and return data for that product.")
+                                st.rerun()
+                            except sqlite3.IntegrityError:
+                                st.info("This supplied product is already assigned to the selected admin.")
+                            finally:
+                                conn.close()
+
+                    with supplier_remove_col:
+                        if st.button("Remove Product", width="stretch"):
+                            conn = get_connection()
+                            c = conn.cursor()
+                            c.execute(
+                                '''
+                                DELETE FROM product_suppliers
+                                WHERE username=? AND item_code=?
+                                ''',
+                                (supplier_username, supplier_item_options[supplier_item])
+                            )
+                            conn.commit()
+                            conn.close()
+                            st.success("Supplied product assignment removed. The admin will no longer see that product's related records.")
+                            st.rerun()
+
+                with supplier_table_col:
+                    if product_assignments_df.empty:
+                        st.info("No supplied product assignments exist yet. Assign products so admins can see their related invoices, payments, and returns.")
+                    else:
+                        st.dataframe(
+                            product_assignments_df,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "id": "ID",
+                                "username": "Admin / Supplier",
+                                "item_code": "Item Code",
+                                "item_name": "Item Name",
+                            }
+                        )
+
+    if menu == "Locations" and is_super_admin():
+        conn = get_connection()
+        locations_df = pd.read_sql_query(
+            "SELECT id, name, address, owner_username, active, created_at FROM locations ORDER BY name",
+            conn
+        )
+        users_df = pd.read_sql_query(
+            "SELECT username, role FROM users WHERE role IN ('super_admin', 'admin', 'sales') ORDER BY username",
+            conn
+        )
+        assignments_df = pd.read_sql_query(
+            '''
+            SELECT ul.id, ul.username, u.role, l.name AS location
+            FROM user_locations ul
+            LEFT JOIN users u ON ul.username = u.username
+            LEFT JOIN locations l ON ul.location_id = l.id
+            ORDER BY ul.username, l.name
+            ''',
+            conn
+        )
+        conn.close()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Logistics</div>
+                <div class="page-title">Locations</div>
+                <p class="page-subtitle">Create and review separate storage facilities for location-based inventory, pricing, and invoicing.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if "locations_message" in st.session_state:
+            st.success(st.session_state.locations_message)
+            del st.session_state.locations_message
+
+        create_location_col, view_location_col = st.columns([0.9, 1.1])
+
+        with create_location_col:
+            st.markdown('<div class="dashboard-section-title">Create Location</div>', unsafe_allow_html=True)
+            owner_options = [""] + users_df["username"].tolist() if not users_df.empty else [""]
+
+            with st.form("create_location_form"):
+                location_name = st.text_input("Location Name")
+                location_address = st.text_area("Address / Notes")
+                owner_username = st.selectbox("Owner/Admin", owner_options)
+                save_location = st.form_submit_button("Save Location", type="primary", width="stretch")
+
+            if save_location:
+                if not location_name.strip():
+                    st.error("Location name is required before a storage location can be created.")
+                else:
+                    conn = get_connection()
+                    c = conn.cursor()
+
+                    try:
+                        c.execute(
+                            '''
+                            INSERT INTO locations (name,address,owner_username,active,created_at)
+                            VALUES (?,?,?,?,?)
+                            ''',
+                            (
+                                location_name.strip(),
+                                location_address.strip(),
+                                owner_username or None,
+                                1,
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            )
+                        )
+                        conn.commit()
+                        st.session_state.locations_message = "Location created successfully."
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("A location with this name already exists. Use a unique location name.")
+                    finally:
+                        conn.close()
+
+        with view_location_col:
+            st.markdown('<div class="dashboard-section-title">Existing Locations</div>', unsafe_allow_html=True)
+
+            if locations_df.empty:
+                st.info("No storage locations have been created yet. Ruth can create the first location from the form on the left.")
+            else:
+                display_locations_df = locations_df.copy()
+                display_locations_df["active"] = display_locations_df["active"].map({1: "Active", 0: "Inactive"})
+                st.dataframe(
+                    display_locations_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "name": "Location",
+                        "address": "Address / Notes",
+                        "owner_username": "Owner/Admin",
+                        "active": "Status",
+                        "created_at": "Created",
+                    }
+                )
+
+                st.markdown('<div class="dashboard-section-title">Edit Location</div>', unsafe_allow_html=True)
+                location_ids = locations_df["id"].astype(int).tolist()
+                selected_location_id = st.selectbox(
+                    "Select Location",
+                    location_ids,
+                    format_func=lambda location_id: (
+                        f"{locations_df.loc[locations_df['id'] == location_id, 'name'].iloc[0]} (ID {location_id})"
+                    ),
+                    key="edit_location_id"
+                )
+                selected_location = locations_df[locations_df["id"] == selected_location_id].iloc[0]
+                owner_options = [""] + users_df["username"].tolist() if not users_df.empty else [""]
+                current_owner = selected_location["owner_username"] if pd.notna(selected_location["owner_username"]) else ""
+                owner_index = owner_options.index(current_owner) if current_owner in owner_options else 0
+
+                with st.form("edit_location_form"):
+                    edited_location_name = st.text_input(
+                        "Location Name",
+                        value=selected_location["name"],
+                        key=f"edit_location_name_{selected_location_id}"
+                    )
+                    edited_location_address = st.text_area(
+                        "Address / Notes",
+                        value=selected_location["address"] if pd.notna(selected_location["address"]) else "",
+                        key=f"edit_location_address_{selected_location_id}"
+                    )
+                    edited_owner_username = st.selectbox(
+                        "Owner/Admin",
+                        owner_options,
+                        index=owner_index,
+                        key=f"edit_location_owner_{selected_location_id}"
+                    )
+                    edited_active = st.checkbox(
+                        "Active",
+                        value=bool(selected_location["active"]),
+                        key=f"edit_location_active_{selected_location_id}"
+                    )
+                    update_location = st.form_submit_button("Update Location", type="primary", width="stretch")
+
+                if update_location:
+                    if not edited_location_name.strip():
+                        st.error("Location name is required before this storage location can be updated.")
+                    else:
+                        conn = get_connection()
+                        c = conn.cursor()
+
+                        try:
+                            c.execute(
+                                '''
+                                UPDATE locations
+                                SET name=?, address=?, owner_username=?, active=?
+                                WHERE id=?
+                                ''',
+                                (
+                                    edited_location_name.strip(),
+                                    edited_location_address.strip(),
+                                    edited_owner_username or None,
+                                    1 if edited_active else 0,
+                                    selected_location_id
+                                )
+                            )
+                            conn.commit()
+                            st.session_state.locations_message = "Location updated successfully."
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("A location with this name already exists. Use a unique location name.")
+                        finally:
+                            conn.close()
+
+        st.markdown("---")
+        st.markdown('<div class="dashboard-section-title">Assign Users to Locations</div>', unsafe_allow_html=True)
+
+        if locations_df.empty or users_df.empty:
+            st.info("Create at least one location and one admin or sales user before assigning location access.")
+        else:
+            assignment_col, assignment_table_col = st.columns([0.9, 1.1])
+
+            with assignment_col:
+                assignable_users_df = users_df[users_df["role"].isin(["admin", "sales"])]
+
+                if assignable_users_df.empty:
+                    st.info("Create an admin or sales user before assigning them to a location.")
+                else:
+                    assignment_user = st.selectbox(
+                        "User",
+                        assignable_users_df["username"].tolist(),
+                        key="assignment_user"
+                    )
+                    assignment_location_options = {
+                        f"{row['name']} (ID {row['id']})": int(row["id"])
+                        for _, row in locations_df.iterrows()
+                    }
+                    assignment_location = st.selectbox(
+                        "Location",
+                        list(assignment_location_options.keys()),
+                        key="assignment_location"
+                    )
+
+                    assign_col, remove_col = st.columns(2)
+
+                    with assign_col:
+                        if st.button("Assign Location", type="primary", width="stretch"):
+                            conn = get_connection()
+                            c = conn.cursor()
+
+                            try:
+                                c.execute(
+                                    '''
+                                    INSERT INTO user_locations (username, location_id)
+                                    VALUES (?,?)
+                                    ''',
+                                    (assignment_user, assignment_location_options[assignment_location])
+                                )
+                                conn.commit()
+                                st.session_state.locations_message = "Location assignment saved."
+                                st.rerun()
+                            except sqlite3.IntegrityError:
+                                st.info("This user already has access to the selected location.")
+                            finally:
+                                conn.close()
+
+                    with remove_col:
+                        if st.button("Remove Assignment", width="stretch"):
+                            conn = get_connection()
+                            c = conn.cursor()
+                            c.execute(
+                                '''
+                                DELETE FROM user_locations
+                                WHERE username=? AND location_id=?
+                                ''',
+                                (assignment_user, assignment_location_options[assignment_location])
+                            )
+                            conn.commit()
+                            conn.close()
+                            st.session_state.locations_message = "Location assignment removed."
+                            st.rerun()
+
+            with assignment_table_col:
+                if assignments_df.empty:
+                    st.info("No location assignments exist yet. Assign admins or sales users to locations to enable role-scoped access.")
+                else:
+                    st.dataframe(
+                        assignments_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "id": "ID",
+                            "username": "User",
+                            "role": "Role",
+                            "location": "Location",
+                        }
+                    )
+
+    if menu == "Location Inventory" and has_admin_access():
+        conn = get_connection()
+        locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
+        inventory_df = pd.read_sql_query("SELECT item_code, item_name, description, quantity FROM inventory ORDER BY item_name", conn)
+        location_stock_df = pd.read_sql_query(
+            '''
+            SELECT li.id, li.location_id, l.name AS location, li.item_code, i.item_name, li.quantity,
+                   COALESCE(lp.price, 0) AS price
+            FROM location_inventory li
+            LEFT JOIN locations l ON li.location_id = l.id
+            LEFT JOIN inventory i ON li.item_code = i.item_code
+            LEFT JOIN location_prices lp
+                ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+            ORDER BY l.name, i.item_name
+            ''',
+            conn
+        )
+        conn.close()
+
+        assigned_location_ids = get_assigned_location_ids()
+        if not is_super_admin():
+            locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
+            location_stock_df = location_stock_df[
+                location_stock_df["location_id"].isin(assigned_location_ids)
+            ].copy()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Owner Inventory</div>
+                <div class="page-title">Location Inventory</div>
+                <p class="page-subtitle">Manage item quantities and pricing for each storage location.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        stock_form_col, stock_table_col = st.columns([0.9, 1.1])
+
+        with stock_form_col:
+            st.markdown('<div class="dashboard-section-title">Set Location Stock / Price</div>', unsafe_allow_html=True)
+
+            if locations_df.empty or inventory_df.empty:
+                st.info("No active locations are available for your account. Ruth must assign you to an active location first.")
+            else:
+                location_options = {
+                    f"{row['name']} (ID {row['id']})": int(row["id"])
+                    for _, row in locations_df.iterrows()
+                }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                    for _, row in inventory_df.iterrows()
+                }
+
+                with st.form("location_inventory_form"):
+                    selected_location = st.selectbox("Location", list(location_options.keys()))
+                    selected_item = st.selectbox("Inventory Item", list(item_options.keys()))
+                    location_quantity = st.number_input("Location Quantity", min_value=0, step=1)
+                    location_price = st.number_input("Location Price", min_value=0.0, step=0.01, format="%.2f")
+                    save_location_stock = st.form_submit_button("Save Stock / Price", type="primary", width="stretch")
+
+                if save_location_stock:
+                    conn = get_connection()
+                    c = conn.cursor()
+                    location_id = location_options[selected_location]
+                    item_code = item_options[selected_item]
+                    c.execute(
+                        '''
+                        INSERT INTO location_inventory (location_id,item_code,quantity)
+                        VALUES (?,?,?)
+                        ON CONFLICT(location_id,item_code)
+                        DO UPDATE SET quantity=excluded.quantity
+                        ''',
+                        (location_id, item_code, int(location_quantity))
+                    )
+                    c.execute(
+                        '''
+                        INSERT INTO location_prices (location_id,item_code,price)
+                        VALUES (?,?,?)
+                        ON CONFLICT(location_id,item_code)
+                        DO UPDATE SET price=excluded.price
+                        ''',
+                        (location_id, item_code, float(location_price))
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success("Location stock and price saved successfully for the selected item.")
+                    st.rerun()
+
+        with stock_table_col:
+            st.markdown('<div class="dashboard-section-title">All Location Stock</div>', unsafe_allow_html=True)
+
+            if location_stock_df.empty:
+                st.info("No location inventory records exist yet. Add stock and pricing for a location to populate this table.")
+            else:
+                st.dataframe(
+                    location_stock_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "location_id": None,
+                        "location": "Location",
+                        "item_code": "Item Code",
+                        "item_name": "Item Name",
+                        "quantity": "Quantity",
+                        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    }
+                )
+
+    if menu == "Financials" and has_admin_access():
+        conn = get_connection()
+        locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
+        inventory_df = pd.read_sql_query("SELECT item_code, item_name FROM inventory ORDER BY item_name", conn)
+        invoices_df = pd.read_sql_query(
+            '''
+            SELECT inv.id, inv.location_id, inv.invoice_number, l.name AS location,
+                   GROUP_CONCAT(DISTINCT ii.item_code) AS item_codes, inv.customer_name,
+                   inv.created_by, inv.total, COALESCE(SUM(p.amount), 0) AS paid,
+                   inv.total - COALESCE(SUM(p.amount), 0) AS outstanding,
+                   inv.status, inv.created_at
+            FROM invoices inv
+            LEFT JOIN locations l ON inv.location_id = l.id
+            LEFT JOIN invoice_items ii ON ii.invoice_id = inv.id
+            LEFT JOIN payments p ON p.invoice_id = inv.id
+            GROUP BY inv.id
+            ORDER BY inv.id DESC
+            ''',
+            conn
+        )
+        payments_df = pd.read_sql_query(
+            '''
+            SELECT p.id, inv.location_id, inv.invoice_number,
+                   GROUP_CONCAT(DISTINCT ii.item_code) AS item_codes,
+                   p.amount, p.payment_method,
+                   p.reference_number, p.received_by, p.paid_at
+            FROM payments p
+            LEFT JOIN invoices inv ON p.invoice_id = inv.id
+            LEFT JOIN invoice_items ii ON ii.invoice_id = inv.id
+            GROUP BY p.id
+            ORDER BY p.id DESC
+            ''',
+            conn
+        )
+        conn.close()
+
+        assigned_location_ids = get_assigned_location_ids()
+        if not is_super_admin():
+            supplied_item_codes = set(get_supplied_item_codes())
+            locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
+            invoices_df = invoices_df[invoices_df["location_id"].isin(assigned_location_ids)].copy()
+            payments_df = payments_df[payments_df["location_id"].isin(assigned_location_ids)].copy()
+            inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
+
+            if supplied_item_codes:
+                invoices_df = invoices_df[
+                    invoices_df["item_codes"].fillna("").apply(
+                        lambda item_codes: bool(set(item_codes.split(",")) & supplied_item_codes)
+                    )
+                ].copy()
+                payments_df = payments_df[
+                    payments_df["item_codes"].fillna("").apply(
+                        lambda item_codes: bool(set(item_codes.split(",")) & supplied_item_codes)
+                    )
+                ].copy()
+            else:
+                invoices_df = invoices_df.iloc[0:0].copy()
+                payments_df = payments_df.iloc[0:0].copy()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Owner Finance</div>
+                <div class="page-title">Financials</div>
+                <p class="page-subtitle">View invoices, payments, payment methods, and outstanding balances across all locations.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        total_invoice_amount = float(invoices_df["total"].sum()) if not invoices_df.empty else 0
+        total_paid = float(invoices_df["paid"].sum()) if not invoices_df.empty else 0
+        total_outstanding = float(invoices_df["outstanding"].sum()) if not invoices_df.empty else 0
+        financial_col1, financial_col2, financial_col3 = st.columns(3)
+
+        with financial_col1:
+            st.markdown(
+                f"""
+                <div class="dashboard-card">
+                    <div class="dashboard-card-label">Invoice Total</div>
+                    <div class="dashboard-card-value">${total_invoice_amount:,.2f}</div>
+                    <div class="dashboard-card-note">All locations</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with financial_col2:
+            st.markdown(
+                f"""
+                <div class="dashboard-card">
+                    <div class="dashboard-card-label">Paid</div>
+                    <div class="dashboard-card-value">${total_paid:,.2f}</div>
+                    <div class="dashboard-card-note">Received payments</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with financial_col3:
+            st.markdown(
+                f"""
+                <div class="dashboard-card">
+                    <div class="dashboard-card-label">Outstanding</div>
+                    <div class="dashboard-card-value">${total_outstanding:,.2f}</div>
+                    <div class="dashboard-card-note">Open balance</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.markdown('<div class="dashboard-section-title">Payment Summary by Method</div>', unsafe_allow_html=True)
+
+        if payments_df.empty:
+            st.info("No payments have been recorded for the records you can access yet.")
+        else:
+            payment_summary_df = (
+                payments_df.groupby("payment_method", as_index=False)["amount"]
+                .sum()
+                .sort_values("amount", ascending=False)
+            )
+            st.dataframe(
+                payment_summary_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "payment_method": "Payment Method",
+                    "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                }
+            )
+
+        invoice_form_col, payment_form_col = st.columns(2)
+
+        with invoice_form_col:
+            st.markdown('<div class="dashboard-section-title">Create Invoice</div>', unsafe_allow_html=True)
+
+            if locations_df.empty or inventory_df.empty:
+                if is_super_admin():
+                    st.info("Create at least one active location and one inventory item before creating invoices.")
+                elif locations_df.empty and inventory_df.empty:
+                    st.info("Ruth must assign this admin to at least one location and one supplied product before this admin can create invoices.")
+                elif locations_df.empty:
+                    st.info("Ruth must assign this admin to at least one active location before this admin can create invoices.")
+                else:
+                    st.info("Ruth must assign supplied products to this admin before this admin can create invoices.")
+            else:
+                location_options = {
+                    f"{row['name']} (ID {row['id']})": int(row["id"])
+                    for _, row in locations_df.iterrows()
+                }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                    for _, row in inventory_df.iterrows()
+                }
+
+                with st.form("create_invoice_form"):
+                    invoice_location = st.selectbox("Location", list(location_options.keys()), key="invoice_location")
+                    customer_name = st.text_input("Customer / Company Name")
+                    invoice_item = st.selectbox("Item", list(item_options.keys()), key="invoice_item")
+                    invoice_quantity = st.number_input("Quantity", min_value=1, step=1, key="invoice_quantity")
+                    invoice_unit_price = st.number_input("Unit Price", min_value=0.0, step=0.01, format="%.2f")
+                    create_invoice = st.form_submit_button("Create Invoice", type="primary", width="stretch")
+
+                if create_invoice:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    location_id = location_options[invoice_location]
+                    item_code = item_options[invoice_item]
+                    quantity_int = int(invoice_quantity)
+                    conn = get_connection()
+                    c = conn.cursor()
+
+                    try:
+                        c.execute("BEGIN IMMEDIATE")
+                        c.execute(
+                            '''
+                            SELECT quantity FROM location_inventory
+                            WHERE location_id=? AND item_code=?
+                            ''',
+                            (location_id, item_code)
+                        )
+                        stock_row = c.fetchone()
+                        available_quantity = int(stock_row[0]) if stock_row else 0
+
+                        if quantity_int > available_quantity:
+                            conn.rollback()
+                            st.error("Not enough stock is available at the selected location to create this invoice.")
+                        else:
+                            c.execute(
+                                '''
+                                SELECT price FROM location_prices
+                                WHERE location_id=? AND item_code=?
+                                ''',
+                                (location_id, item_code)
+                            )
+                            price_row = c.fetchone()
+                            unit_price = float(invoice_unit_price)
+                            if unit_price == 0 and price_row:
+                                unit_price = float(price_row[0])
+
+                            invoice_total = quantity_int * unit_price
+                            c.execute(
+                                '''
+                                UPDATE location_inventory
+                                SET quantity=?
+                                WHERE location_id=? AND item_code=?
+                                ''',
+                                (available_quantity - quantity_int, location_id, item_code)
+                            )
+                            c.execute(
+                                '''
+                                INSERT INTO invoices
+                                (location_id,customer_name,created_by,subtotal,total,status,created_at)
+                                VALUES (?,?,?,?,?,?,?)
+                                ''',
+                                (
+                                    location_id,
+                                    customer_name.strip(),
+                                    st.session_state.username,
+                                    invoice_total,
+                                    invoice_total,
+                                    "open",
+                                    now
+                                )
+                            )
+                            invoice_id = c.lastrowid
+                            invoice_number = f"INV-{invoice_id:05d}"
+                            c.execute("UPDATE invoices SET invoice_number=? WHERE id=?", (invoice_number, invoice_id))
+                            c.execute(
+                                '''
+                                INSERT INTO invoice_items
+                                (invoice_id,item_code,quantity,unit_price,line_total)
+                                VALUES (?,?,?,?,?)
+                                ''',
+                                (
+                                    invoice_id,
+                                    item_code,
+                                    quantity_int,
+                                    unit_price,
+                                    invoice_total
+                                )
+                            )
+                            conn.commit()
+                            st.success(f"Invoice {invoice_number} created successfully. Location inventory was reduced automatically.")
+                            st.rerun()
+                    finally:
+                        conn.close()
+
+        with payment_form_col:
+            st.markdown('<div class="dashboard-section-title">Record Payment</div>', unsafe_allow_html=True)
+
+            if invoices_df.empty:
+                st.info("Create at least one invoice before recording customer payments.")
+            else:
+                invoice_options = {
+                    f"{row['invoice_number']} - {row['customer_name']} (${float(row['outstanding']):,.2f} due)": int(row["id"])
+                    for _, row in invoices_df.iterrows()
+                }
+
+                with st.form("record_payment_form"):
+                    selected_invoice = st.selectbox("Invoice", list(invoice_options.keys()))
+                    payment_amount = st.number_input("Payment Amount", min_value=0.0, step=0.01, format="%.2f")
+                    payment_method = st.selectbox("Payment Method", ["cash", "check", "wire", "credit_card"])
+                    reference_number = st.text_input("Reference Number")
+                    record_payment = st.form_submit_button("Record Payment", type="primary", width="stretch")
+
+                if record_payment:
+                    if payment_amount <= 0:
+                        st.error("Payment amount must be greater than zero before it can be recorded.")
+                    else:
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        invoice_id = invoice_options[selected_invoice]
+                        conn = get_connection()
+                        c = conn.cursor()
+                        c.execute(
+                            '''
+                            INSERT INTO payments
+                            (invoice_id,amount,payment_method,reference_number,received_by,paid_at)
+                            VALUES (?,?,?,?,?,?)
+                            ''',
+                            (
+                                invoice_id,
+                                float(payment_amount),
+                                payment_method,
+                                reference_number.strip(),
+                                st.session_state.username,
+                                now
+                            )
+                        )
+                        c.execute(
+                            '''
+                            SELECT inv.total - COALESCE(SUM(p.amount), 0)
+                            FROM invoices inv
+                            LEFT JOIN payments p ON p.invoice_id = inv.id
+                            WHERE inv.id=?
+                            GROUP BY inv.id
+                            ''',
+                            (invoice_id,)
+                        )
+                        outstanding_row = c.fetchone()
+                        if outstanding_row and float(outstanding_row[0]) <= 0:
+                            c.execute("UPDATE invoices SET status='paid' WHERE id=?", (invoice_id,))
+                        conn.commit()
+                        conn.close()
+                        st.success("Payment recorded successfully. Invoice status was updated if the balance is fully paid.")
+                        st.rerun()
+
+        st.markdown('<div class="dashboard-section-title">Invoices</div>', unsafe_allow_html=True)
+        if invoices_df.empty:
+            st.info("No invoices have been created for the records you can access yet.")
+        else:
+            st.dataframe(
+                invoices_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "id": "ID",
+                    "location_id": None,
+                    "item_codes": None,
+                    "invoice_number": "Invoice",
+                    "location": "Location",
+                    "customer_name": "Customer",
+                    "created_by": "Created By",
+                    "total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                    "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
+                    "outstanding": st.column_config.NumberColumn("Outstanding", format="$%.2f"),
+                    "status": "Status",
+                    "created_at": "Created",
+                }
+            )
+
+        st.markdown('<div class="dashboard-section-title">Payments</div>', unsafe_allow_html=True)
+        if payments_df.empty:
+            st.info("No payments have been recorded for the records you can access yet.")
+        else:
+            st.dataframe(
+                payments_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "id": "ID",
+                    "location_id": None,
+                    "item_codes": None,
+                    "invoice_number": "Invoice",
+                    "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                    "payment_method": "Method",
+                    "reference_number": "Reference",
+                    "received_by": "Received By",
+                    "paid_at": "Paid At",
+                }
+            )
+
+    if menu == "Returns" and (has_admin_access() or get_current_role() == "sales"):
+        conn = get_connection()
+        locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
+        inventory_df = pd.read_sql_query("SELECT item_code, item_name FROM inventory ORDER BY item_name", conn)
+        returns_df = pd.read_sql_query(
+            '''
+            SELECT r.id, r.location_id, l.name AS location, r.item_code, i.item_name, r.quantity, r.reason,
+                   r.condition_status, r.recorded_by, r.status, r.created_at
+            FROM returns r
+            LEFT JOIN locations l ON r.location_id = l.id
+            LEFT JOIN inventory i ON r.item_code = i.item_code
+            ORDER BY r.id DESC
+            ''',
+            conn
+        )
+        conn.close()
+
+        assigned_location_ids = get_assigned_location_ids()
+        if not is_super_admin():
+            locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
+            returns_df = returns_df[returns_df["location_id"].isin(assigned_location_ids)].copy()
+
+            if get_current_role() == "admin":
+                supplied_item_codes = set(get_supplied_item_codes())
+                inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
+
+                if supplied_item_codes:
+                    returns_df = returns_df[returns_df["item_code"].isin(supplied_item_codes)].copy()
+                else:
+                    returns_df = returns_df.iloc[0:0].copy()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Quality Control</div>
+                <div class="page-title">Returns / Bad Items</div>
+                <p class="page-subtitle">Record returned, damaged, defective, or otherwise bad inventory by location.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        return_form_col, return_table_col = st.columns([0.9, 1.1])
+
+        with return_form_col:
+            st.markdown('<div class="dashboard-section-title">Record Return</div>', unsafe_allow_html=True)
+
+            if locations_df.empty or inventory_df.empty:
+                st.info("No active locations are available for your account. Ruth must assign you to an active location before returns can be recorded.")
+            else:
+                location_options = {
+                    f"{row['name']} (ID {row['id']})": int(row["id"])
+                    for _, row in locations_df.iterrows()
+                }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                    for _, row in inventory_df.iterrows()
+                }
+
+                with st.form("record_return_form"):
+                    selected_location = st.selectbox("Location", list(location_options.keys()))
+                    selected_item = st.selectbox("Item", list(item_options.keys()))
+                    return_quantity = st.number_input("Quantity", min_value=1, step=1)
+                    condition_status = st.selectbox(
+                        "Condition",
+                        ["bad", "damaged", "defective", "expired", "customer_return"]
+                    )
+                    return_reason = st.text_area("Reason")
+                    save_return = st.form_submit_button("Save Return", type="primary", width="stretch")
+
+                if save_return:
+                    conn = get_connection()
+                    c = conn.cursor()
+                    c.execute(
+                        '''
+                        INSERT INTO returns
+                        (location_id,item_code,quantity,reason,condition_status,recorded_by,status,created_at)
+                        VALUES (?,?,?,?,?,?,?,?)
+                        ''',
+                        (
+                            location_options[selected_location],
+                            item_options[selected_item],
+                            int(return_quantity),
+                            return_reason.strip(),
+                            condition_status,
+                            st.session_state.username,
+                            "open",
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success("Return or damaged item recorded successfully for the selected location.")
+                    st.rerun()
+
+        with return_table_col:
+            st.markdown('<div class="dashboard-section-title">Return Records</div>', unsafe_allow_html=True)
+
+            if returns_df.empty:
+                st.info("No returned or damaged items have been recorded for the records you can access yet.")
+            else:
+                st.dataframe(
+                    returns_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "location_id": None,
+                        "location": "Location",
+                        "item_code": "Item Code",
+                        "item_name": "Item Name",
+                        "quantity": "Quantity",
+                        "reason": "Reason",
+                        "condition_status": "Condition",
+                        "recorded_by": "Recorded By",
+                        "status": "Status",
+                        "created_at": "Created",
+                    }
+                )
+
+    if menu == "Transfers" and has_admin_access():
+        conn = get_connection()
+        locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
+        inventory_df = pd.read_sql_query("SELECT item_code, item_name FROM inventory ORDER BY item_name", conn)
+        transfers_df = pd.read_sql_query(
+            '''
+            SELECT t.id, t.source_location_id, t.destination_location_id,
+                   t.item_code, i.item_name, src.name AS source_location,
+                   dest.name AS destination_location, t.quantity, t.requested_by,
+                   t.approved_by, t.status, t.created_at, t.completed_at
+            FROM inventory_transfers t
+            LEFT JOIN inventory i ON t.item_code = i.item_code
+            LEFT JOIN locations src ON t.source_location_id = src.id
+            LEFT JOIN locations dest ON t.destination_location_id = dest.id
+            ORDER BY t.id DESC
+            ''',
+            conn
+        )
+        conn.close()
+
+        assigned_location_ids = get_assigned_location_ids()
+        if not is_super_admin():
+            locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
+            transfers_df = transfers_df[
+                transfers_df["source_location_id"].isin(assigned_location_ids)
+                | transfers_df["destination_location_id"].isin(assigned_location_ids)
+            ].copy()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Logistics</div>
+                <div class="page-title">Inventory Transfers</div>
+                <p class="page-subtitle">Track inventory movement requests between storage locations.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        transfer_form_col, transfer_table_col = st.columns([0.9, 1.1])
+
+        with transfer_form_col:
+            st.markdown('<div class="dashboard-section-title">Create Transfer</div>', unsafe_allow_html=True)
+
+            if len(locations_df) < 2 or inventory_df.empty:
+                st.info("At least two active assigned locations and one inventory item are required before recording transfers.")
+            else:
+                location_options = {
+                    f"{row['name']} (ID {row['id']})": int(row["id"])
+                    for _, row in locations_df.iterrows()
+                }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                    for _, row in inventory_df.iterrows()
+                }
+
+                with st.form("create_transfer_form"):
+                    transfer_item = st.selectbox("Item", list(item_options.keys()))
+                    source_location = st.selectbox("From Location", list(location_options.keys()))
+                    destination_location = st.selectbox("To Location", list(location_options.keys()))
+                    transfer_quantity = st.number_input("Quantity", min_value=1, step=1)
+                    transfer_status = st.selectbox("Status", ["pending", "completed"])
+                    save_transfer = st.form_submit_button("Save Transfer", type="primary", width="stretch")
+
+                if save_transfer:
+                    if source_location == destination_location:
+                        st.error("Source and destination locations must be different for an inventory transfer.")
+                    else:
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        conn = get_connection()
+                        c = conn.cursor()
+                        item_code = item_options[transfer_item]
+                        source_location_id = location_options[source_location]
+                        destination_location_id = location_options[destination_location]
+                        transfer_quantity_int = int(transfer_quantity)
+
+                        try:
+                            c.execute("BEGIN IMMEDIATE")
+
+                            if transfer_status == "completed":
+                                c.execute(
+                                    '''
+                                    SELECT quantity FROM location_inventory
+                                    WHERE location_id=? AND item_code=?
+                                    ''',
+                                    (source_location_id, item_code)
+                                )
+                                source_stock = c.fetchone()
+                                source_quantity = int(source_stock[0]) if source_stock else 0
+
+                                if transfer_quantity_int > source_quantity:
+                                    conn.rollback()
+                                    st.error("The source location does not have enough stock to complete this transfer.")
+                                    conn.close()
+                                    st.stop()
+
+                                c.execute(
+                                    '''
+                                    UPDATE location_inventory
+                                    SET quantity=?
+                                    WHERE location_id=? AND item_code=?
+                                    ''',
+                                    (source_quantity - transfer_quantity_int, source_location_id, item_code)
+                                )
+                                c.execute(
+                                    '''
+                                    INSERT INTO location_inventory (location_id,item_code,quantity)
+                                    VALUES (?,?,?)
+                                    ON CONFLICT(location_id,item_code)
+                                    DO UPDATE SET quantity=location_inventory.quantity + excluded.quantity
+                                    ''',
+                                    (destination_location_id, item_code, transfer_quantity_int)
+                                )
+
+                            c.execute(
+                                '''
+                                INSERT INTO inventory_transfers
+                                (item_code,source_location_id,destination_location_id,quantity,requested_by,approved_by,status,created_at,completed_at)
+                                VALUES (?,?,?,?,?,?,?,?,?)
+                                ''',
+                                (
+                                    item_code,
+                                    source_location_id,
+                                    destination_location_id,
+                                    transfer_quantity_int,
+                                    st.session_state.username,
+                                    st.session_state.username if transfer_status == "completed" else None,
+                                    transfer_status,
+                                    now,
+                                    now if transfer_status == "completed" else None
+                                )
+                            )
+                            conn.commit()
+                            st.success("Transfer recorded successfully. Completed transfers update source and destination stock levels.")
+                            st.rerun()
+                        finally:
+                            conn.close()
+
+        with transfer_table_col:
+            st.markdown('<div class="dashboard-section-title">Transfer Records</div>', unsafe_allow_html=True)
+
+            if transfers_df.empty:
+                st.info("No inventory transfers have been recorded for the locations you can access yet.")
+            else:
+                st.dataframe(
+                    transfers_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "id": "ID",
+                        "source_location_id": None,
+                        "destination_location_id": None,
+                        "item_code": "Item Code",
+                        "item_name": "Item Name",
+                        "source_location": "From",
+                        "destination_location": "To",
+                        "quantity": "Quantity",
+                        "requested_by": "Requested By",
+                        "approved_by": "Approved By",
+                        "status": "Status",
+                        "created_at": "Created",
+                        "completed_at": "Completed",
+                    }
+                )
+
+    if menu == "Manage Sales" and is_super_admin():
 
         conn = get_connection()
         sales_df = pd.read_sql_query(
@@ -2882,7 +4145,7 @@ else:
             sales_df = sales_df[sales_df["transaction_type"] == "sale"].copy()
 
         if sales_df.empty:
-            st.info("No sales records found yet. User sales will appear here after inventory is scanned or submitted.")
+            st.info("No sales records are available yet. Sales will appear here after users or sales staff complete sale transactions.")
         else:
             sales_df["quantity_before"] = sales_df["quantity_before"].fillna(0).astype(int)
             sales_df["quantity_after"] = sales_df["quantity_after"].fillna(0).astype(int)
@@ -2964,7 +4227,7 @@ else:
                 valid_dates = sales_df["sale_date"].dropna()
                 if valid_dates.empty:
                     selected_dates = None
-                    st.info("No valid sale dates available.")
+                    st.info("No valid sale dates are available for the current sales records.")
                 else:
                     selected_dates = st.date_input(
                         "Date Range",
@@ -2991,7 +4254,7 @@ else:
             with summary_col1:
                 st.markdown('<div class="dashboard-section-title">Sales by Item</div>', unsafe_allow_html=True)
                 if filtered_sales_df.empty:
-                    st.info("No item sales match the selected filters.")
+                    st.info("No item sales match the selected filters. Adjust the filters to broaden the results.")
                 else:
                     item_sales_df = (
                         filtered_sales_df.groupby("item_code", as_index=False)["quantity_used"]
@@ -3011,7 +4274,7 @@ else:
             with summary_col2:
                 st.markdown('<div class="dashboard-section-title">Sales by User</div>', unsafe_allow_html=True)
                 if filtered_sales_df.empty:
-                    st.info("No user sales match the selected filters.")
+                    st.info("No user sales match the selected filters. Adjust the filters to broaden the results.")
                 else:
                     user_sales_df = (
                         filtered_sales_df.groupby("username", as_index=False)["quantity_used"]
@@ -3031,7 +4294,7 @@ else:
             st.markdown('<div class="dashboard-section-title">Sales Records</div>', unsafe_allow_html=True)
 
             if filtered_sales_df.empty:
-                st.info("No sales records match the selected filters.")
+                st.info("No sales records match the selected filters. Try changing the user, item, or date range.")
             else:
                 sales_record_search = st.text_input(
                     "Search Sales Records",
@@ -3048,7 +4311,7 @@ else:
                     ]
 
                 if filtered_sales_df.empty:
-                    st.info("No sales records match the search.")
+                    st.info("No sales records match the search text. Try a different user or item code.")
                 else:
                     records_df = filtered_sales_df[
                         ["id", "username", "item_code", "quantity_before", "quantity_used", "quantity_after", "transaction_time"]
@@ -3110,7 +4373,7 @@ else:
             if scanned_code:
                 st.session_state.prefill_scan_item_code = scanned_code
                 st.session_state.menu = "Scan Inventory"
-                st.success(f"Code detected: {scanned_code}")
+                st.success(f"Code detected: {scanned_code}. The item code has been copied into the inventory lookup flow.")
                 st.rerun()
             elif scan_error:
                 st.warning(scan_error)
@@ -3172,7 +4435,7 @@ else:
             st.markdown('<div class="dashboard-section-title">Receive Stock</div>', unsafe_allow_html=True)
 
             if not item_code:
-                st.info("Enter an item code on the left to load the item and receive stock.")
+                st.info("Enter an item code on the left to load item details and receive stock into your account.")
 
         if item_code:
 
@@ -3286,7 +4549,7 @@ else:
 
                                 if transfer_qty_int > system_quantity_before:
                                     transfer_conn.rollback()
-                                    st.error("Not enough system stock available.")
+                                    st.error("Not enough system stock is available to allocate that quantity.")
                                 else:
                                     system_quantity_after = system_quantity_before - transfer_qty_int
                                     user_quantity_after = user_quantity_before + transfer_qty_int
@@ -3329,7 +4592,7 @@ else:
 
                                     transfer_conn.commit()
                                     st.session_state.scan_inventory_message = (
-                                        f"{transfer_qty_int} unit(s) added to your stock. Your quantity is now {user_quantity_after}. System remaining quantity is {system_quantity_after}."
+                                        f"{transfer_qty_int} unit(s) added to your personal stock. Your quantity is now {user_quantity_after}; system stock is now {system_quantity_after}."
                                     )
                                     st.rerun()
 
@@ -3347,7 +4610,238 @@ else:
 
             conn.close()
 
-    if menu == "Sell Item":
+    if menu == "Sell Item" and get_current_role() == "sales":
+        if "sales_invoice_message" in st.session_state:
+            st.success(st.session_state.sales_invoice_message)
+            del st.session_state.sales_invoice_message
+
+        assigned_location_ids = get_assigned_location_ids()
+
+        conn = get_connection()
+        locations_df = pd.read_sql_query(
+            "SELECT id, name FROM locations WHERE active=1 ORDER BY name",
+            conn
+        )
+        inventory_df = pd.read_sql_query(
+            '''
+            SELECT li.location_id, li.item_code, i.item_name, li.quantity,
+                   COALESCE(lp.price, 0) AS price
+            FROM location_inventory li
+            LEFT JOIN inventory i ON li.item_code = i.item_code
+            LEFT JOIN location_prices lp
+                ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+            WHERE li.quantity > 0
+            ORDER BY i.item_name
+            ''',
+            conn
+        )
+        conn.close()
+
+        locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
+        inventory_df = inventory_df[inventory_df["location_id"].isin(assigned_location_ids)].copy()
+
+        st.markdown(
+            """
+            <div class="page-header">
+                <div class="page-eyebrow">Location Sale</div>
+                <div class="page-title">Sell Item</div>
+                <p class="page-subtitle">Create invoices from assigned location inventory using location-specific pricing.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        sale_form_col, sale_table_col = st.columns([0.9, 1.1])
+
+        with sale_form_col:
+            st.markdown('<div class="dashboard-section-title">Create Sale Invoice</div>', unsafe_allow_html=True)
+
+            if locations_df.empty:
+                st.info("You do not have any active assigned locations yet. Ruth must assign you to a location before you can sell.")
+            elif inventory_df.empty:
+                st.info("No sellable inventory exists for your assigned locations. Ask an admin or Ruth to add location stock.")
+            else:
+                location_options = {
+                    f"{row['name']} (ID {row['id']})": int(row["id"])
+                    for _, row in locations_df.iterrows()
+                }
+                create_sale_invoice = False
+                can_create_sale_invoice = False
+
+                with st.form("sales_create_invoice_form"):
+                    selected_location = st.selectbox("Location", list(location_options.keys()))
+                    selected_location_id = location_options[selected_location]
+                    available_items_df = inventory_df[inventory_df["location_id"] == selected_location_id].copy()
+
+                    item_options = {
+                        f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available - ${float(row['price']):.2f}":
+                        row["item_code"]
+                        for _, row in available_items_df.iterrows()
+                    }
+
+                    if not item_options:
+                        st.info("This selected location has no available inventory to sell.")
+                        st.form_submit_button("Create Sale", disabled=True, width="stretch")
+                    else:
+                        can_create_sale_invoice = True
+                        customer_name = st.text_input("Customer / Company Name")
+                        selected_item = st.selectbox("Item", list(item_options.keys()))
+                        selected_item_code = item_options[selected_item]
+                        selected_item_row = available_items_df[
+                            available_items_df["item_code"] == selected_item_code
+                        ].iloc[0]
+                        available_quantity = int(selected_item_row["quantity"])
+                        default_price = float(selected_item_row["price"])
+                        sale_quantity = st.number_input(
+                            "Quantity",
+                            min_value=1,
+                            max_value=max(available_quantity, 1),
+                            step=1
+                        )
+                        unit_price = st.number_input(
+                            "Unit Price",
+                            min_value=0.0,
+                            value=default_price,
+                            step=0.01,
+                            format="%.2f"
+                        )
+                        payment_amount = st.number_input(
+                            "Payment Amount",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.01,
+                            format="%.2f"
+                        )
+                        payment_method = st.selectbox("Payment Method", ["cash", "check", "wire", "credit_card"])
+                        reference_number = st.text_input("Payment Reference")
+                        create_sale_invoice = st.form_submit_button("Create Sale", type="primary", width="stretch")
+
+                if create_sale_invoice and can_create_sale_invoice:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    quantity_int = int(sale_quantity)
+                    line_total = quantity_int * float(unit_price)
+                    conn = get_connection()
+                    c = conn.cursor()
+
+                    try:
+                        c.execute("BEGIN IMMEDIATE")
+                        c.execute(
+                            '''
+                            SELECT quantity FROM location_inventory
+                            WHERE location_id=? AND item_code=?
+                            ''',
+                            (selected_location_id, selected_item_code)
+                        )
+                        stock_row = c.fetchone()
+                        current_quantity = int(stock_row[0]) if stock_row else 0
+
+                        if quantity_int > current_quantity:
+                            conn.rollback()
+                            st.error("Not enough inventory is available at this assigned location to complete the sale.")
+                        else:
+                            c.execute(
+                                '''
+                                UPDATE location_inventory
+                                SET quantity=?
+                                WHERE location_id=? AND item_code=?
+                                ''',
+                                (current_quantity - quantity_int, selected_location_id, selected_item_code)
+                            )
+                            c.execute(
+                                '''
+                                INSERT INTO invoices
+                                (location_id,customer_name,created_by,subtotal,total,status,created_at)
+                                VALUES (?,?,?,?,?,?,?)
+                                ''',
+                                (
+                                    selected_location_id,
+                                    customer_name.strip(),
+                                    st.session_state.username,
+                                    line_total,
+                                    line_total,
+                                    "open",
+                                    now
+                                )
+                            )
+                            invoice_id = c.lastrowid
+                            invoice_number = f"INV-{invoice_id:05d}"
+                            c.execute("UPDATE invoices SET invoice_number=? WHERE id=?", (invoice_number, invoice_id))
+                            c.execute(
+                                '''
+                                INSERT INTO invoice_items
+                                (invoice_id,item_code,quantity,unit_price,line_total)
+                                VALUES (?,?,?,?,?)
+                                ''',
+                                (invoice_id, selected_item_code, quantity_int, float(unit_price), line_total)
+                            )
+                            if payment_amount > 0:
+                                c.execute(
+                                    '''
+                                    INSERT INTO payments
+                                    (invoice_id,amount,payment_method,reference_number,received_by,paid_at)
+                                    VALUES (?,?,?,?,?,?)
+                                    ''',
+                                    (
+                                        invoice_id,
+                                        float(payment_amount),
+                                        payment_method,
+                                        reference_number.strip(),
+                                        st.session_state.username,
+                                        now
+                                    )
+                                )
+                                if float(payment_amount) >= line_total:
+                                    c.execute("UPDATE invoices SET status='paid' WHERE id=?", (invoice_id,))
+
+                            c.execute(
+                                '''
+                                INSERT INTO transactions
+                                (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
+                                VALUES (?,?,?,?,?,?,?)
+                                ''',
+                                (
+                                    st.session_state.username,
+                                    selected_item_code,
+                                    quantity_int,
+                                    current_quantity,
+                                    current_quantity - quantity_int,
+                                    "sale",
+                                    now
+                                )
+                            )
+                            conn.commit()
+                            st.session_state.sales_invoice_message = (
+                                f"Sale invoice {invoice_number} created successfully. Assigned location inventory was reduced and payment details were saved if provided."
+                            )
+                            st.rerun()
+                    finally:
+                        conn.close()
+
+        with sale_table_col:
+            st.markdown('<div class="dashboard-section-title">Assigned Location Stock</div>', unsafe_allow_html=True)
+
+            if inventory_df.empty:
+                st.info("No assigned location stock is available for your sales account.")
+            else:
+                display_stock_df = inventory_df.merge(
+                    locations_df.rename(columns={"id": "location_id", "name": "location"}),
+                    on="location_id",
+                    how="left"
+                )[["location", "item_code", "item_name", "quantity", "price"]]
+                st.dataframe(
+                    display_stock_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "location": "Location",
+                        "item_code": "Item Code",
+                        "item_name": "Item Name",
+                        "quantity": "Available",
+                        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    }
+                )
+
+    if menu == "Sell Item" and get_current_role() != "sales":
 
         if "sell_item_message" in st.session_state:
             st.success(st.session_state.sell_item_message)
@@ -3404,7 +4898,7 @@ else:
             st.markdown('<div class="dashboard-section-title">Record Sale</div>', unsafe_allow_html=True)
 
             if not sell_item_code:
-                st.info("Enter an item code on the left to load your available quantity.")
+                st.info("Enter an item code on the left to load your available quantity before saving a sale.")
 
         if sell_item_code:
             conn = get_connection()
@@ -3514,7 +5008,7 @@ else:
 
                                 if quantity_sold_int > quantity_before:
                                     sale_conn.rollback()
-                                    st.error("Not enough quantity in your stock. Add stock from Scan Inventory first.")
+                                    st.error("Not enough quantity is available in your personal stock. Add stock from Scan Inventory first.")
                                 else:
                                     quantity_after = quantity_before - quantity_sold_int
 
@@ -3546,7 +5040,7 @@ else:
 
                                     sale_conn.commit()
                                     st.session_state.sell_item_message = (
-                                        f"Sale saved successfully. Sold {quantity_sold_int} unit(s). Remaining quantity is {quantity_after}."
+                                        f"Sale saved successfully. Sold {quantity_sold_int} unit(s) from your personal stock; remaining quantity is {quantity_after}."
                                     )
                                     st.rerun()
 
@@ -3566,9 +5060,31 @@ else:
             conn
         )
 
+        invoice_logs_df = pd.read_sql_query(
+            '''
+            SELECT inv.id, inv.location_id, inv.created_by AS username, ii.item_code,
+                   'sale' AS transaction_type, 0 AS quantity_before,
+                   ii.quantity AS quantity_used, 0 AS quantity_after,
+                   inv.created_at AS transaction_time
+            FROM invoices inv
+            LEFT JOIN invoice_items ii ON ii.invoice_id = inv.id
+            ORDER BY inv.id DESC
+            ''',
+            conn
+        )
+
         conn.close()
 
-        if st.session_state.role != "admin" and not df.empty:
+        if has_admin_access() and not is_super_admin():
+            assigned_location_ids = get_assigned_location_ids()
+            supplied_item_codes = set(get_supplied_item_codes())
+            df = invoice_logs_df[invoice_logs_df["location_id"].isin(assigned_location_ids)].copy()
+
+            if supplied_item_codes:
+                df = df[df["item_code"].isin(supplied_item_codes)].copy()
+            else:
+                df = df.iloc[0:0].copy()
+        elif not has_admin_access() and not df.empty:
             df = df[df["username"] == st.session_state.username].copy()
 
         st.markdown(
@@ -3649,7 +5165,7 @@ else:
         )
 
         if df.empty:
-            st.info("No transactions recorded yet.")
+            st.info("No transactions are available for the records you can access yet.")
         else:
             search_term = st.text_input(
                 "Search logs",
