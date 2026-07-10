@@ -14,6 +14,7 @@ ENV/
 
 # Local database and generated assets
 *.db
+!inventory.db
 *.sqlite
 *.sqlite3
 qr_*.png
