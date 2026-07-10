@@ -49,6 +49,20 @@ def is_super_admin():
     return get_current_role() == "super_admin"
 
 
+def logout_user():
+    keys_to_clear = [
+        "logged_in",
+        "username",
+        "role",
+        "menu",
+    ]
+
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
+    st.session_state.logged_in = False
+
+
 def get_assigned_location_ids(username=None):
     username = username or st.session_state.get("username", "")
 
@@ -87,6 +101,360 @@ def get_supplied_item_codes(username=None):
         return []
 
     return supplied_df["item_code"].astype(str).tolist()
+
+
+ITEM_CODE_REFERENCE_TABLES = [
+    ("user_inventory", "item_code"),
+    ("transactions", "item_code"),
+    ("location_inventory", "item_code"),
+    ("location_prices", "item_code"),
+    ("invoice_items", "item_code"),
+    ("returns", "item_code"),
+    ("inventory_transfers", "item_code"),
+    ("product_suppliers", "item_code"),
+]
+
+
+LIVE_ITEM_CODE_REFERENCE_TABLES = [
+    ("user_inventory", "item_code"),
+    ("location_inventory", "item_code"),
+    ("location_prices", "item_code"),
+    ("product_suppliers", "item_code"),
+]
+
+
+def update_item_code_references(cursor, old_item_code, new_item_code):
+    for table_name, column_name in ITEM_CODE_REFERENCE_TABLES:
+        cursor.execute(
+            f"UPDATE {table_name} SET {column_name}=? WHERE {column_name}=?",
+            (new_item_code, old_item_code)
+        )
+
+
+def delete_item_code_references(cursor, item_code):
+    for table_name, column_name in LIVE_ITEM_CODE_REFERENCE_TABLES:
+        cursor.execute(
+            f"DELETE FROM {table_name} WHERE {column_name}=?",
+            (item_code,)
+        )
+
+
+def get_invoice_balance(cursor, invoice_id):
+    cursor.execute(
+        '''
+        SELECT inv.total - COALESCE(SUM(p.amount), 0)
+        FROM invoices inv
+        LEFT JOIN payments p ON p.invoice_id = inv.id
+        WHERE inv.id=?
+        GROUP BY inv.id
+        ''',
+        (invoice_id,)
+    )
+    balance_row = cursor.fetchone()
+    return float(balance_row[0]) if balance_row else None
+
+
+def transaction_verification_status(row):
+    transaction_type = row.get("transaction_type", "legacy")
+    quantity_before = int(row.get("quantity_before") or 0)
+    quantity_used = int(row.get("quantity_used") or 0)
+    quantity_after = int(row.get("quantity_after") or 0)
+
+    if transaction_type in {"sale", "return", "take_out"}:
+        expected_after = quantity_before - quantity_used
+    elif transaction_type == "allocation":
+        expected_after = quantity_before + quantity_used
+    else:
+        return "Unverified"
+
+    return "Verified" if expected_after == quantity_after else "Review"
+
+
+def render_setup_checklist():
+    role = get_current_role()
+    username = st.session_state.get("username", "")
+
+    conn = get_connection()
+    locations_count = conn.execute(
+        "SELECT COUNT(*) FROM locations WHERE active=1"
+    ).fetchone()[0]
+    inventory_count = conn.execute(
+        "SELECT COUNT(*) FROM inventory"
+    ).fetchone()[0]
+    location_stock_count = conn.execute(
+        "SELECT COUNT(*) FROM location_inventory WHERE quantity > 0"
+    ).fetchone()[0]
+    assigned_location_count = conn.execute(
+        "SELECT COUNT(*) FROM user_locations WHERE username=?",
+        (username,)
+    ).fetchone()[0]
+    supplied_product_count = conn.execute(
+        "SELECT COUNT(*) FROM product_suppliers WHERE username=?",
+        (username,)
+    ).fetchone()[0]
+    personal_stock_count = conn.execute(
+        "SELECT COUNT(*) FROM user_inventory WHERE username=? AND quantity > 0",
+        (username,)
+    ).fetchone()[0]
+
+    assigned_stock_count = 0
+    supplied_assigned_stock_count = 0
+
+    if assigned_location_count:
+        assigned_stock_count = conn.execute(
+            '''
+            SELECT COUNT(*)
+            FROM location_inventory li
+            INNER JOIN user_locations ul ON ul.location_id = li.location_id
+            WHERE ul.username=? AND li.quantity > 0
+            ''',
+            (username,)
+        ).fetchone()[0]
+
+    if assigned_location_count and supplied_product_count:
+        supplied_assigned_stock_count = conn.execute(
+            '''
+            SELECT COUNT(*)
+            FROM location_inventory li
+            INNER JOIN user_locations ul ON ul.location_id = li.location_id
+            INNER JOIN product_suppliers ps ON ps.item_code = li.item_code
+            WHERE ul.username=? AND ps.username=? AND li.quantity > 0
+            ''',
+            (username, username)
+        ).fetchone()[0]
+
+    conn.close()
+
+    if role == "super_admin":
+        checks = [
+            ("Active locations", locations_count > 0, "Create at least one storage location."),
+            ("Master inventory", inventory_count > 0, "Add inventory items to the master list."),
+            ("Location stock", location_stock_count > 0, "Add quantity and pricing in Location Inventory."),
+        ]
+    elif role == "admin":
+        checks = [
+            ("Assigned location", assigned_location_count > 0, "Ruth must assign this admin to a location."),
+            ("Supplied products", supplied_product_count > 0, "Ruth must assign products supplied by this admin."),
+            ("Invoice-ready stock", supplied_assigned_stock_count > 0, "Add stock for supplied products at assigned locations."),
+        ]
+    elif role == "sales":
+        checks = [
+            ("Assigned location", assigned_location_count > 0, "Ruth must assign this sales user to a location."),
+            ("Sellable stock", assigned_stock_count > 0, "Add stock and pricing for assigned locations."),
+        ]
+    else:
+        checks = [
+            ("Master inventory available", inventory_count > 0, "An admin must add inventory first."),
+            ("Personal stock", personal_stock_count > 0, "Use Scan Inventory to add stock to your account."),
+        ]
+
+    complete_count = sum(1 for _, complete, _ in checks if complete)
+    total_count = len(checks)
+    setup_percent = int((complete_count / max(total_count, 1)) * 100)
+    progress_segments = []
+    detail_rows = []
+
+    for index, (label, complete, next_step) in enumerate(checks, start=1):
+        status = "Ready" if complete else "Needs setup"
+        segment_class = "ready" if complete else "pending"
+        segment_title = safe_html(f"{label}: {status}")
+        label_safe = safe_html(label)
+        detail_safe = safe_html("Complete" if complete else next_step)
+
+        progress_segments.append(
+            f'<div class="setup-level-segment {segment_class}" title="{segment_title}">'
+            f'<span>{label_safe}</span>'
+            f'</div>'
+        )
+        detail_rows.append(
+            f'<div class="setup-barcode-row">'
+            f'<span class="setup-barcode-index">{index}</span>'
+            f'<span class="setup-barcode-name">{label_safe}</span>'
+            f'<span class="setup-barcode-status {segment_class}">{status}</span>'
+            f'</div>'
+            f'<div class="setup-barcode-detail">{detail_safe}</div>'
+        )
+
+    st.markdown(
+        f"""
+        <style>
+        .setup-barcode-card {{
+            border: 1px solid rgba(15, 23, 42, 0.12);
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.72);
+            padding: 0.65rem 0.75rem;
+            margin-bottom: 0.8rem;
+        }}
+
+        .setup-barcode-head {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            margin-bottom: 0.45rem;
+        }}
+
+        .setup-barcode-title {{
+            color: #0f172a;
+            font-size: 0.9rem;
+            font-weight: 800;
+        }}
+
+        .setup-barcode-level {{
+            color: #475569;
+            font-size: 0.78rem;
+            font-weight: 700;
+            white-space: nowrap;
+        }}
+
+        .setup-level-track {{
+            display: grid;
+            grid-template-columns: repeat({total_count}, minmax(0, 1fr));
+            gap: 6px;
+            min-height: 32px;
+            margin-bottom: 0.5rem;
+        }}
+
+        .setup-level-segment {{
+            position: relative;
+            min-width: 0;
+            border-radius: 999px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 0.25rem;
+            border: 1px solid rgba(15, 23, 42, 0.1);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+        }}
+
+        .setup-level-segment.ready {{
+            background: linear-gradient(135deg, #15803d, #22c55e);
+        }}
+
+        .setup-level-segment.pending {{
+            background: #f8fafc;
+        }}
+
+        .setup-level-segment span {{
+            max-width: 100%;
+            color: #ffffff;
+            padding: 0.08rem 0.35rem;
+            font-size: 0.68rem;
+            font-weight: 800;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+
+        .setup-level-segment.pending span {{
+            color: #334155;
+        }}
+
+        .setup-barcode-progress {{
+            height: 5px;
+            background: #e2e8f0;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 0.45rem;
+        }}
+
+        .setup-barcode-progress-fill {{
+            height: 100%;
+            width: {setup_percent}%;
+            background: #16a34a;
+        }}
+
+        .setup-barcode-row {{
+            display: grid;
+            grid-template-columns: 1.7rem 1fr auto;
+            gap: 0.45rem;
+            align-items: center;
+            color: #0f172a;
+            font-size: 0.76rem;
+            line-height: 1.2;
+        }}
+
+        .setup-barcode-index {{
+            color: #64748b;
+            font-weight: 800;
+        }}
+
+        .setup-barcode-name {{
+            font-weight: 800;
+        }}
+
+        .setup-barcode-status {{
+            font-weight: 800;
+            font-size: 0.72rem;
+        }}
+
+        .setup-barcode-status.ready {{
+            color: #15803d;
+        }}
+
+        .setup-barcode-status.pending {{
+            color: #b45309;
+        }}
+
+        .setup-barcode-detail {{
+            color: #64748b;
+            font-size: 0.72rem;
+            margin: 0.05rem 0 0.28rem 2.15rem;
+            line-height: 1.2;
+        }}
+        </style>
+        <div class="setup-barcode-card">
+            <div class="setup-barcode-head">
+                <div class="setup-barcode-title">Setup Progress</div>
+                <div class="setup-barcode-level">{complete_count}/{total_count} ready · {setup_percent}%</div>
+            </div>
+            <div class="setup-level-track">
+                {''.join(progress_segments)}
+            </div>
+            <div class="setup-barcode-progress">
+                <div class="setup-barcode-progress-fill"></div>
+            </div>
+            {''.join(detail_rows)}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def format_currency(value):
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "$0.00"
+
+
+def stock_status(quantity):
+    quantity = int(quantity or 0)
+
+    if quantity <= 0:
+        return "Out of stock"
+    if quantity <= 5:
+        return "Low stock"
+    return "In stock"
+
+
+def invoice_status_label(status, outstanding):
+    if str(status).lower() == "paid" or float(outstanding or 0) <= 0:
+        return "Paid"
+    return "Open balance"
+
+
+def is_paid_label(total, paid, outstanding):
+    if float(outstanding or 0) <= 0:
+        return "Yes"
+    if float(paid or 0) > 0:
+        return "Partially Paid"
+    return "No"
+
+
+def show_next_step(message, next_step):
+    st.info(f"{message}\n\nNext step: {next_step}")
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -326,11 +694,11 @@ else:
             width: 100%;
             justify-content: flex-start;
             text-align: left;
-            border-radius: 10px;
+            border-radius: 6px;
             border: 0;
-            background: rgba(255, 255, 255, 0.56);
+            background: transparent;
             color: #0f172a;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+            box-shadow: none;
             font-size: 0.92rem;
             font-weight: 650;
             min-height: 2rem;
@@ -344,15 +712,15 @@ else:
         }
 
         [data-testid="stSidebar"] .stButton > button:hover {
-            background: rgba(255, 255, 255, 0.84);
+            background: rgba(255, 255, 255, 0.35);
             color: #0f172a;
-            box-shadow: inset 3px 0 0 #2563eb, 0 4px 14px rgba(15, 23, 42, 0.12);
+            box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.65);
         }
 
         [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-            background: linear-gradient(135deg, #2563eb, #1d4ed8);
-            color: #ffffff;
-            box-shadow: 0 12px 24px rgba(37, 99, 235, 0.3);
+            background: rgba(37, 99, 235, 0.12);
+            color: #1d4ed8;
+            box-shadow: inset 3px 0 0 #2563eb;
         }
 
         [data-testid="stSidebar"] .stButton > button p {
@@ -367,7 +735,7 @@ else:
         }
 
         [data-testid="stSidebar"] .stButton > button[kind="primary"] p {
-            color: #ffffff;
+            color: #1d4ed8;
         }
 
         [data-testid="stSidebar"] [data-testid="stButton"] {
@@ -515,6 +883,7 @@ else:
         [data-testid="stDateInput"] input {
             background: #ffffff !important;
             color: #0f172a !important;
+            caret-color: #000000 !important;
             border: 1px solid rgba(37, 99, 235, 0.22) !important;
             border-radius: 12px !important;
             box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06) !important;
@@ -1611,7 +1980,190 @@ else:
             background: #e54b4b;
         }
 
+        .page-header {
+            margin-top: 0;
+            margin-bottom: 0.85rem;
+        }
+
+        .page-title {
+            font-size: 1.55rem;
+            line-height: 1.12;
+            margin-bottom: 0.15rem;
+        }
+
+        .page-subtitle {
+            font-size: 0.88rem;
+            line-height: 1.35;
+        }
+
+        .dashboard-section-title,
+        .admin-panel-title {
+            margin-top: 0.45rem;
+            margin-bottom: 0.4rem;
+            font-size: 0.98rem;
+        }
+
+        .dashboard-card,
+        .content-panel,
+        .analytics-card,
+        .user-chart-card,
+        .admin-panel,
+        .workflow-panel,
+        .item-card {
+            border-radius: 10px;
+            padding: 0.75rem;
+        }
+
+        .dashboard-card,
+        .user-metric-card,
+        .admin-stat-card {
+            min-height: 92px;
+        }
+
+        .admin-stat-value,
+        .dashboard-card-value,
+        .user-metric-value {
+            font-size: 1.55rem;
+            line-height: 1.05;
+        }
+
+        .admin-stat-label,
+        .dashboard-card-label,
+        .user-metric-label,
+        .preview-label,
+        .action-summary-label {
+            font-size: 0.72rem;
+        }
+
+        .admin-stat-note,
+        .dashboard-card-note,
+        .user-metric-note,
+        .workflow-text,
+        .item-meta {
+            font-size: 0.76rem;
+            line-height: 1.3;
+        }
+
+        .workflow-kicker {
+            font-size: 0.68rem;
+            margin-bottom: 0.12rem;
+        }
+
+        .workflow-title {
+            font-size: 0.95rem;
+            margin-bottom: 0.12rem;
+        }
+
+        .modern-form-note {
+            color: #475569;
+            font-size: 0.78rem;
+            line-height: 1.35;
+            margin: -0.1rem 0 0.35rem;
+        }
+
+        .modern-form-summary {
+            border: 1px solid rgba(15, 23, 42, 0.1);
+            border-radius: 10px;
+            background: linear-gradient(180deg, #ffffff, #f8fafc);
+            padding: 0.65rem;
+            margin: 0.35rem 0 0.7rem;
+        }
+
+        .modern-form-summary-title {
+            color: #0f172a;
+            font-size: 0.78rem;
+            font-weight: 800;
+            margin-bottom: 0.45rem;
+        }
+
+        .modern-form-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.45rem;
+        }
+
+        .modern-form-summary-grid.four {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
+        .modern-form-summary-card {
+            min-width: 0;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 0.55rem;
+        }
+
+        .modern-form-summary-label {
+            color: #64748b;
+            font-size: 0.67rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0;
+            margin-bottom: 0.16rem;
+        }
+
+        .modern-form-summary-value {
+            color: #0f172a;
+            font-size: 0.92rem;
+            font-weight: 850;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .action-summary-grid {
+            gap: 0.45rem;
+        }
+
+        .action-summary-card {
+            min-height: 72px;
+            padding: 0.65rem;
+            border-radius: 10px;
+        }
+
+        .preview-row,
+        .admin-status-row {
+            padding: 0.45rem 0;
+        }
+
+        [data-testid="stDataFrame"] {
+            margin-top: 0.25rem;
+        }
+
+        [data-testid="stForm"] {
+            padding: 0.85rem 1rem;
+            border-radius: 10px;
+        }
+
+        [data-testid="stForm"] [data-testid="stTextInput"],
+        [data-testid="stForm"] [data-testid="stNumberInput"],
+        [data-testid="stForm"] [data-testid="stSelectbox"],
+        [data-testid="stForm"] [data-testid="stTextArea"] {
+            margin-bottom: 0.35rem;
+        }
+
+        [data-testid="stFormSubmitButton"] button,
+        [data-testid="stButton"] button {
+            min-height: 2.15rem;
+        }
+
+        .stDataFrame,
+        [data-testid="stDataFrame"] {
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        [data-testid="stVerticalBlock"] {
+            gap: 0.65rem;
+        }
+
         @media (max-width: 900px) {
+            .modern-form-summary-grid,
+            .modern-form-summary-grid.four {
+                grid-template-columns: 1fr 1fr;
+            }
+
             .user-flow-grid {
                 grid-template-columns: 1fr;
             }
@@ -1636,13 +2188,18 @@ else:
         <div class="sidebar-brand">
             <div class="sidebar-brand-mark">TE</div>
             <div>
-                <div class="sidebar-brand-title">Tarakji Enterprise<div>
+                <div class="sidebar-brand-title">Tarakji Enterprise</div>
                 <div class="sidebar-brand-subtitle">Stock control panel</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True
     )
+
+    if st.sidebar.button("Sign out", key="logout_button_top", type="secondary", width="stretch"):
+        logout_user()
+        st.rerun()
+
     st.sidebar.markdown("---")
 
     if "menu" not in st.session_state:
@@ -1668,68 +2225,89 @@ else:
     menu_icons["Returns"] = "RET"
     menu_icons["Transfers"] = "TRN"
 
-    if has_admin_access():
-        main_items = ["Dashboard", "Transaction Logs"]
-    elif get_current_role() == "sales":
-        main_items = ["Dashboard", "Sell Item", "Returns", "Transaction Logs"]
-    else:
-        main_items = ["Dashboard", "Scan Inventory", "Scan QR / Barcode", "Sell Item", "Transaction Logs"]
+    menu_icons.update({
+        "Dashboard": "📊",
+        "Scan Inventory": "📥",
+        "Scan QR / Barcode": "▣",
+        "Transaction Logs": "🧾",
+        "Add Inventory": "➕",
+        "View Inventory": "📦",
+        "Print QR Codes": "🏷️",
+        "User Management": "👤",
+        "Manage Sales": "📈",
+        "Sell Item": "💳",
+        "Locations": "📍",
+        "Location Inventory": "🏬",
+        "Financials": "💵",
+        "Returns": "↩️",
+        "Transfers": "⇄",
+        "Logout": "⏻",
+    })
 
-    admin_items = (
-        [
-            "Location Inventory",
-            "Financials",
-            "Returns",
-            "Transfers",
-        ]
-        if has_admin_access()
-        else []
-    )
+    menu_labels = {
+        "Dashboard": "Overview",
+        "Scan Inventory": "Receive Stock",
+        "Scan QR / Barcode": "Scan QR / Barcode",
+        "Transaction Logs": "Activity Logs",
+        "Add Inventory": "Inventory Entry",
+        "View Inventory": "Inventory View",
+        "Print QR Codes": "QR Labels",
+        "User Management": "Users & Access",
+        "Manage Sales": "Sales Reports",
+        "Sell Item": "Create Sale",
+        "Locations": "Locations",
+        "Location Inventory": "Stock & Pricing",
+        "Financials": "Financials",
+        "Returns": "Returns / Damaged",
+        "Transfers": "Transfers",
+        "Logout": "Sign Out",
+    }
 
     if is_super_admin():
-        admin_items = [
-            "Add Inventory",
-            "View Inventory",
-            "Print QR Codes",
-            "Manage Sales",
-            "User Management",
-            "Locations",
-            "Location Inventory",
-            "Financials",
-            "Returns",
-            "Transfers",
+        nav_sections = [
+            ("Operations", ["Dashboard", "Location Inventory", "Returns", "Transfers"]),
+            ("Finance", ["Financials"]),
+            ("Setup", ["Locations", "User Management", "Add Inventory", "View Inventory", "Print QR Codes"]),
+            ("Reports", ["Manage Sales", "Transaction Logs"]),
+        ]
+    elif get_current_role() == "admin":
+        nav_sections = [
+            ("Operations", ["Dashboard", "Location Inventory", "Returns", "Transfers"]),
+            ("Finance", ["Financials"]),
+            ("Reports", ["Transaction Logs"]),
+        ]
+    elif get_current_role() == "sales":
+        nav_sections = [
+            ("Operations", ["Dashboard", "Scan Inventory", "Sell Item", "Returns"]),
+            ("Reports", ["Transaction Logs"]),
+        ]
+    else:
+        nav_sections = [
+            ("Operations", ["Dashboard", "Scan Inventory", "Scan QR / Barcode", "Sell Item"]),
+            ("Reports", ["Transaction Logs"]),
         ]
 
-    allowed_items = main_items + admin_items + ["Logout"]
+    allowed_items = [
+        item
+        for _, section_items in nav_sections
+        for item in section_items
+    ] + ["Logout"]
 
     if st.session_state.menu not in allowed_items:
-        st.session_state.menu = "Dashboard" if has_admin_access() else "Scan Inventory"
+        st.session_state.menu = "Dashboard"
 
-    st.sidebar.markdown(
-        '<div class="sidebar-section-label">Main</div>',
-        unsafe_allow_html=True
-    )
+    for section_index, (section_name, section_items) in enumerate(nav_sections):
+        if section_index:
+            st.sidebar.markdown("---")
 
-    for item in main_items:
-        if st.sidebar.button(
-            f"{menu_icons.get(item, '•')}  {item}",
-            key=f"menu_{item}",
-            type="primary" if st.session_state.menu == item else "secondary",
-            width="stretch"
-        ):
-            st.session_state.menu = item
-            st.rerun()
-
-    if admin_items:
-        st.sidebar.markdown("---")
         st.sidebar.markdown(
-            '<div class="sidebar-section-label">Admin</div>',
+            f'<div class="sidebar-section-label">{section_name}</div>',
             unsafe_allow_html=True
         )
 
-        for item in admin_items:
+        for item in section_items:
             if st.sidebar.button(
-                f"{menu_icons.get(item, '•')}  {item}",
+                f"{menu_icons.get(item, '•')}  {menu_labels.get(item, item)}",
                 key=f"menu_{item}",
                 type="primary" if st.session_state.menu == item else "secondary",
                 width="stretch"
@@ -1744,17 +2322,190 @@ else:
     )
 
     if st.sidebar.button(
-        f"{menu_icons['Logout']}  Logout",
-        key="menu_Logout",
-        type="primary" if st.session_state.menu == "Logout" else "secondary",
+        f"{menu_icons['Logout']}  {menu_labels['Logout']}",
+        key="logout_button",
+        type="secondary",
         width="stretch"
     ):
-        st.session_state.menu = "Logout"
+        logout_user()
         st.rerun()
 
     menu = st.session_state.menu
 
-    if menu == "Dashboard" and not has_admin_access():
+    if menu == "Dashboard":
+        render_setup_checklist()
+
+    if menu == "Dashboard" and get_current_role() == "sales":
+        username_safe = safe_html(st.session_state.username)
+        assigned_location_ids = get_assigned_location_ids()
+        supplied_item_codes = set(get_supplied_item_codes())
+        supplied_item_codes = set(get_supplied_item_codes())
+
+        conn = get_connection()
+        sales_locations_df = pd.read_sql_query(
+            "SELECT id, name FROM locations WHERE active=1",
+            conn
+        )
+        sales_stock_df = pd.read_sql_query(
+            '''
+            SELECT li.location_id, l.name AS location, li.item_code, i.item_name,
+                   li.quantity, COALESCE(lp.price, 0) AS price
+            FROM location_inventory li
+            LEFT JOIN locations l ON li.location_id = l.id
+            LEFT JOIN inventory i ON li.item_code = i.item_code
+            LEFT JOIN location_prices lp ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+            WHERE li.quantity > 0
+            ''',
+            conn
+        )
+        sales_invoice_df = pd.read_sql_query(
+            '''
+            SELECT inv.invoice_number, inv.location_id, l.name AS location, inv.customer_name,
+                   inv.total, inv.status, inv.created_at
+            FROM invoices inv
+            LEFT JOIN locations l ON inv.location_id = l.id
+            WHERE inv.created_by=?
+            ORDER BY inv.id DESC
+            ''',
+            conn,
+            params=(st.session_state.username,)
+        )
+        conn.close()
+
+        sales_locations_df = sales_locations_df[
+            sales_locations_df["id"].isin(assigned_location_ids)
+        ].copy()
+        sales_stock_df = sales_stock_df[
+            sales_stock_df["location_id"].isin(assigned_location_ids)
+        ].copy()
+        sales_invoice_df = sales_invoice_df[
+            sales_invoice_df["location_id"].isin(assigned_location_ids)
+        ].copy()
+
+        assigned_location_count = len(sales_locations_df)
+        available_items = sales_stock_df["item_code"].nunique() if not sales_stock_df.empty else 0
+        available_units = int(sales_stock_df["quantity"].sum()) if not sales_stock_df.empty else 0
+        invoices_created = len(sales_invoice_df)
+        invoice_total = float(sales_invoice_df["total"].sum()) if not sales_invoice_df.empty else 0
+
+        st.markdown(
+            f"""
+            <div class="page-header">
+                <div class="page-eyebrow">Sales Dashboard</div>
+                <div class="page-title">Welcome, {username_safe}</div>
+                <p class="page-subtitle">Review assigned locations, available stock, and your recent sales activity.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        sales_col1, sales_col2, sales_col3, sales_col4 = st.columns(4)
+
+        with sales_col1:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Locations</div>
+                    <div class="user-metric-value">{assigned_location_count}</div>
+                    <div class="user-metric-note">Assigned active locations</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with sales_col2:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Sellable Items</div>
+                    <div class="user-metric-value">{available_items}</div>
+                    <div class="user-metric-note">Items with available stock</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with sales_col3:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">Available Units</div>
+                    <div class="user-metric-value">{available_units}</div>
+                    <div class="user-metric-note">Total assigned-location stock</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with sales_col4:
+            st.markdown(
+                f"""
+                <div class="user-metric-card">
+                    <div class="user-metric-label">My Invoices</div>
+                    <div class="user-metric-value">{invoices_created}</div>
+                    <div class="user-metric-note">{format_currency(invoice_total)} total created</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        stock_col, invoice_col = st.columns(2)
+
+        with stock_col:
+            with st.container(border=True):
+                st.markdown('<div class="admin-panel-title">Assigned Location Stock</div>', unsafe_allow_html=True)
+
+                if sales_stock_df.empty:
+                    show_next_step(
+                        "No sellable inventory exists for your assigned locations yet.",
+                        "Ask Ruth or an admin to add stock and pricing in Location Inventory."
+                    )
+                else:
+                    stock_display_df = sales_stock_df[
+                        ["location", "item_code", "item_name", "quantity", "price"]
+                    ].copy()
+                    stock_display_df["stock_status"] = stock_display_df["quantity"].apply(stock_status)
+                    st.dataframe(
+                        stock_display_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "location": "Location",
+                            "item_code": "Item Code",
+                            "item_name": "Item Name",
+                            "quantity": "Quantity",
+                            "stock_status": "Stock Status",
+                            "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                        }
+                    )
+
+        with invoice_col:
+            with st.container(border=True):
+                st.markdown('<div class="admin-panel-title">Recent Sales Invoices</div>', unsafe_allow_html=True)
+
+                if sales_invoice_df.empty:
+                    st.info("No sales invoices have been created by your account yet.")
+                else:
+                    recent_sales_df = sales_invoice_df.head(6).copy()
+                    recent_sales_df["total_display"] = recent_sales_df["total"].apply(format_currency)
+                    recent_sales_df = recent_sales_df[
+                        ["invoice_number", "location", "customer_name", "total_display", "status", "created_at"]
+                    ]
+                    st.dataframe(
+                        recent_sales_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "invoice_number": "Invoice",
+                            "location": "Location",
+                            "customer_name": "Customer",
+                            "total_display": "Total",
+                            "status": "Status",
+                            "created_at": "Created",
+                        }
+                    )
+
+    if menu == "Dashboard" and get_current_role() == "user":
         username_safe = safe_html(st.session_state.username)
         conn = get_connection()
         user_transactions_df = pd.read_sql_query(
@@ -1953,6 +2704,8 @@ else:
                     recent_user_df["transaction_type"] = recent_user_df["transaction_type"].replace({
                         "allocation": "Added to My Stock",
                         "sale": "Sold Item",
+                        "return": "Returned to Inventory",
+                        "take_out": "Taken Out",
                         "legacy": "Legacy Record",
                     })
                     recent_user_df = recent_user_df.rename(
@@ -2054,13 +2807,19 @@ else:
         total_used = int(trans_df["quantity_used"].sum()) if not trans_df.empty else 0
         username_safe = safe_html(st.session_state.username)
         role_label = "Super Admin" if is_super_admin() else "Admin"
+        dashboard_scope = "company-wide" if is_super_admin() else "assigned-location and supplied-product"
+        products_note = "Active inventory items" if is_super_admin() else "Visible supplied products"
+        stock_note = "Units available now" if is_super_admin() else "Visible assigned-location stock"
+        activity_note = "Usage records saved" if is_super_admin() else "Visible invoice activity"
+        users_label = "Users" if is_super_admin() else "Scope"
+        users_note = "System accounts" if is_super_admin() else "Your scoped access"
 
         st.markdown(
             f"""
             <div class="admin-dashboard-header">
                 <div>
                     <div class="admin-dashboard-title">Dashboard</div>
-                    <div class="admin-dashboard-subtitle">Welcome back, {username_safe}. Here's what's happening with your Tarakji Enterprise<.</div>
+                    <div class="admin-dashboard-subtitle">Welcome back, {username_safe}. This dashboard shows {dashboard_scope} activity.</div>
                 </div>
                 <div class="admin-profile-pill">
                     <div class="admin-profile-avatar">A</div>
@@ -2083,7 +2842,7 @@ else:
                     <div class="admin-stat-icon">📦</div>
                     <div class="admin-stat-label">Products</div>
                     <div class="admin-stat-value">{total_items}</div>
-                    <div class="admin-stat-note">Active inventory items</div>
+                    <div class="admin-stat-note">{products_note}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -2096,7 +2855,7 @@ else:
                     <div class="admin-stat-icon">🏷</div>
                     <div class="admin-stat-label">Stock Units</div>
                     <div class="admin-stat-value">{total_stock}</div>
-                    <div class="admin-stat-note">Units available now</div>
+                    <div class="admin-stat-note">{stock_note}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -2120,9 +2879,9 @@ else:
                 f"""
                 <div class="admin-stat-card stat-violet">
                     <div class="admin-stat-icon">🧾</div>
-                    <div class="admin-stat-label">Transactions</div>
+                    <div class="admin-stat-label">Activity</div>
                     <div class="admin-stat-value">{total_transactions}</div>
-                    <div class="admin-stat-note">Usage records saved</div>
+                    <div class="admin-stat-note">{activity_note}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -2133,9 +2892,9 @@ else:
                 f"""
                 <div class="admin-stat-card stat-emerald">
                     <div class="admin-stat-icon">👥</div>
-                    <div class="admin-stat-label">Users</div>
+                    <div class="admin-stat-label">{users_label}</div>
                     <div class="admin-stat-value">{total_users}</div>
-                    <div class="admin-stat-note">System accounts</div>
+                    <div class="admin-stat-note">{users_note}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -2146,7 +2905,7 @@ else:
             <div class="dashboard-section-title">Reports & Analytics</div>
             <div class="content-panel" style="margin-bottom: 0.9rem;">
                 <div class="dashboard-card-label">Operational insight</div>
-                <div class="dashboard-card-note">Monitor usage trends, item movement, recent transactions, and low-stock risk from one admin view.</div>
+                <div class="dashboard-card-note">Monitor {dashboard_scope} trends, item movement, recent activity, and low-stock risk from one dashboard.</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -2357,8 +3116,8 @@ else:
                 """
                 <div class="page-header">
                     <div class="page-eyebrow">Admin</div>
-                    <div class="page-title">Add Inventory</div>
-                    <p class="page-subtitle">Create a new stock item and generate a QR code for quick lookup.</p>
+                    <div class="page-title">Inventory Entry</div>
+                    <p class="page-subtitle">Create a stock item with its location, address, quantity, cost, and QR code.</p>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -2367,21 +3126,29 @@ else:
             form_col, preview_col = st.columns([1.05, 0.95])
 
             with form_col:
-                st.markdown('<div class="dashboard-section-title">Item Information</div>', unsafe_allow_html=True)
+                st.markdown('<div class="dashboard-section-title">Inventory Entry</div>', unsafe_allow_html=True)
                 st.markdown('<div class="add-inventory-form">', unsafe_allow_html=True)
 
                 with st.form("add_inventory_form"):
                     item_code = st.text_input("Item Code", key="admin_item_code")
                     item_name = st.text_input("Item Name")
                     description = st.text_area("Description")
+                    location_name = st.text_input("Location Name")
+                    location_address = st.text_area("Location Address")
                     quantity = st.number_input(
                         "Quantity",
                         min_value=1,
                         step=1
                     )
+                    inventory_cost = st.number_input(
+                        "Inventory Cost",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f"
+                    )
 
                     save_inventory = st.form_submit_button(
-                        "Save Inventory",
+                        "Save Inventory Entry",
                         type="primary",
                         width="stretch"
                     )
@@ -2390,21 +3157,37 @@ else:
 
             with preview_col:
                 st.markdown('<div class="dashboard-section-title">Preview</div>', unsafe_allow_html=True)
+                item_code_preview = safe_html(item_code or "Not entered")
+                item_name_preview = safe_html(item_name or "Not entered")
+                location_name_preview = safe_html(location_name or "Not entered")
+                location_address_preview = safe_html(location_address or "Not entered")
                 st.markdown(
                     f"""
                     <div class="content-panel">
                         <div class="preview-list">
                             <div class="preview-row">
                                 <div class="preview-label">Item Code</div>
-                                <div class="preview-value">{item_code or "Not entered"}</div>
+                                <div class="preview-value">{item_code_preview}</div>
                             </div>
                             <div class="preview-row">
                                 <div class="preview-label">Item Name</div>
-                                <div class="preview-value">{item_name or "Not entered"}</div>
+                                <div class="preview-value">{item_name_preview}</div>
+                            </div>
+                            <div class="preview-row">
+                                <div class="preview-label">Location</div>
+                                <div class="preview-value">{location_name_preview}</div>
+                            </div>
+                            <div class="preview-row">
+                                <div class="preview-label">Address</div>
+                                <div class="preview-value">{location_address_preview}</div>
                             </div>
                             <div class="preview-row">
                                 <div class="preview-label">Quantity</div>
                                 <div class="preview-value">{quantity}</div>
+                            </div>
+                            <div class="preview-row">
+                                <div class="preview-label">Inventory Cost</div>
+                                <div class="preview-value">${float(inventory_cost):,.2f}</div>
                             </div>
                         </div>
                     </div>
@@ -2414,29 +3197,78 @@ else:
 
             if save_inventory:
 
-                if not item_code.strip() or not item_name.strip():
-                    st.error("Item code and item name are required before inventory can be saved.")
+                if not item_code.strip() or not item_name.strip() or not location_name.strip():
+                    st.error("Item code, item name, and location name are required before an inventory entry can be saved.")
                 else:
                     conn = get_connection()
                     c = conn.cursor()
 
                     try:
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        c.execute("BEGIN IMMEDIATE")
                         c.execute(
                             '''
                             INSERT INTO inventory
-                            (item_code,item_name,description,quantity)
-                            VALUES (?,?,?,?)
+                            (item_code,item_name,description,quantity,cost)
+                            VALUES (?,?,?,?,?)
                             ''',
-                            (item_code.strip(), item_name.strip(), description.strip(), quantity)
+                            (
+                                item_code.strip(),
+                                item_name.strip(),
+                                description.strip(),
+                                quantity,
+                                float(inventory_cost)
+                            )
+                        )
+                        c.execute(
+                            '''
+                            INSERT INTO locations (name,address,owner_username,active,created_at)
+                            VALUES (?,?,?,?,?)
+                            ON CONFLICT(name)
+                            DO UPDATE SET
+                                address=excluded.address,
+                                active=1
+                            ''',
+                            (
+                                location_name.strip(),
+                                location_address.strip(),
+                                st.session_state.username,
+                                1,
+                                now
+                            )
+                        )
+                        c.execute(
+                            "SELECT id FROM locations WHERE name=?",
+                            (location_name.strip(),)
+                        )
+                        location_id = c.fetchone()[0]
+                        c.execute(
+                            '''
+                            INSERT INTO location_inventory (location_id,item_code,quantity)
+                            VALUES (?,?,?)
+                            ON CONFLICT(location_id,item_code)
+                            DO UPDATE SET quantity=excluded.quantity
+                            ''',
+                            (location_id, item_code.strip(), int(quantity))
+                        )
+                        c.execute(
+                            '''
+                            INSERT INTO location_prices (location_id,item_code,price)
+                            VALUES (?,?,?)
+                            ON CONFLICT(location_id,item_code)
+                            DO UPDATE SET price=excluded.price
+                            ''',
+                            (location_id, item_code.strip(), float(inventory_cost))
                         )
 
                         conn.commit()
                         qr_path = generate_qr(item_code.strip())
 
-                        st.success("Inventory item created successfully. A QR code was generated for this item.")
+                        st.success("Inventory entry created successfully with location, address, cost, and QR code.")
                         st.image(qr_path, caption=f"QR Code: {item_code.strip()}", width=180)
 
                     except sqlite3.IntegrityError:
+                        conn.rollback()
                         st.error("This item code already exists. Use a unique code or edit the existing item.")
 
                     finally:
@@ -2447,7 +3279,15 @@ else:
             conn = get_connection()
 
             df = pd.read_sql_query(
-                "SELECT * FROM inventory",
+                '''
+                SELECT i.id, i.item_code, i.item_name, i.description, i.quantity, i.cost,
+                       COALESCE(l.name, '') AS location_name,
+                       COALESCE(l.address, '') AS location_address
+                FROM inventory i
+                LEFT JOIN location_inventory li ON li.item_code = i.item_code
+                LEFT JOIN locations l ON l.id = li.location_id
+                ORDER BY i.item_name, l.name
+                ''',
                 conn
             )
 
@@ -2457,16 +3297,17 @@ else:
                 """
                 <div class="page-header">
                     <div class="page-eyebrow">Admin</div>
-                    <div class="page-title">View Inventory</div>
-                    <p class="page-subtitle">Browse current stock, search item records, and identify low inventory.</p>
+                    <div class="page-title">Inventory View</div>
+                    <p class="page-subtitle">Browse current stock by item, location, address, quantity, and cost.</p>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            total_items = len(df)
-            total_quantity = int(df["quantity"].sum()) if not df.empty else 0
-            low_stock = int((df["quantity"] <= 5).sum()) if not df.empty else 0
+            unique_inventory_df = df.drop_duplicates(subset=["id"]) if not df.empty else df
+            total_items = len(unique_inventory_df)
+            total_quantity = int(unique_inventory_df["quantity"].sum()) if not unique_inventory_df.empty else 0
+            low_stock = int((unique_inventory_df["quantity"] <= 5).sum()) if not unique_inventory_df.empty else 0
 
             inv_col1, inv_col2, inv_col3 = st.columns(3)
 
@@ -2516,7 +3357,7 @@ else:
             else:
                 search_term = st.text_input(
                     "Search inventory",
-                    placeholder="Search by item code, name, or description",
+                    placeholder="Search by item code, name, description, location, or address",
                     label_visibility="collapsed"
                 )
 
@@ -2528,6 +3369,8 @@ else:
                         display_df["item_code"].str.lower().str.contains(search_term, na=False)
                         | display_df["item_name"].str.lower().str.contains(search_term, na=False)
                         | display_df["description"].str.lower().str.contains(search_term, na=False)
+                        | display_df["location_name"].str.lower().str.contains(search_term, na=False)
+                        | display_df["location_address"].str.lower().str.contains(search_term, na=False)
                     ]
 
                 st.markdown(
@@ -2541,19 +3384,25 @@ else:
 
                 st.markdown('<div class="inventory-action-buttons">', unsafe_allow_html=True)
 
-                header_cols = st.columns([1, 1.4, 2, 0.7, 0.9], gap=None)
-                for col, label in zip(header_cols, ["Item Code", "Item Name", "Description", "Qty", "Action"]):
+                header_cols = st.columns([0.9, 1.2, 1.5, 1.1, 1.4, 0.6, 0.8, 0.8], gap=None)
+                for col, label in zip(
+                    header_cols,
+                    ["Item Code", "Item Name", "Description", "Location", "Address", "Qty", "Cost", "Action"]
+                ):
                     with col:
                         st.markdown(
                             f'<div class="inventory-stream-cell header">{label}</div>',
                             unsafe_allow_html=True
                         )
 
-                for _, row in display_df.iterrows():
-                    row_cols = st.columns([1, 1.4, 2, 0.7, 0.9], gap=None)
+                for row_index, row in display_df.iterrows():
+                    row_cols = st.columns([0.9, 1.2, 1.5, 1.1, 1.4, 0.6, 0.8, 0.8], gap=None)
                     item_code_safe = safe_html(row["item_code"])
                     item_name_safe = safe_html(row["item_name"])
                     description_safe = safe_html(row["description"])
+                    location_name_safe = safe_html(row["location_name"] or "Unassigned")
+                    location_address_safe = safe_html(row["location_address"] or "No address")
+                    cost = float(row["cost"]) if "cost" in row and pd.notna(row["cost"]) else 0.0
 
                     with row_cols[0]:
                         st.markdown(
@@ -2572,11 +3421,26 @@ else:
                         )
                     with row_cols[3]:
                         st.markdown(
-                            f'<div class="inventory-stream-cell strong">{row["quantity"]}</div>',
+                            f'<div class="inventory-stream-cell">{location_name_safe}</div>',
                             unsafe_allow_html=True
                         )
                     with row_cols[4]:
-                        if st.button("Edit", key=f"manage_inventory_{row['id']}", type="primary", width="stretch"):
+                        st.markdown(
+                            f'<div class="inventory-stream-cell">{location_address_safe}</div>',
+                            unsafe_allow_html=True
+                        )
+                    with row_cols[5]:
+                        st.markdown(
+                            f'<div class="inventory-stream-cell strong">{row["quantity"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                    with row_cols[6]:
+                        st.markdown(
+                            f'<div class="inventory-stream-cell strong">${cost:,.2f}</div>',
+                            unsafe_allow_html=True
+                        )
+                    with row_cols[7]:
+                        if st.button("Edit", key=f"manage_inventory_{row['id']}_{row_index}", type="primary", width="stretch"):
                             st.session_state.manage_inventory_id = int(row["id"])
                             st.rerun()
 
@@ -2620,6 +3484,14 @@ else:
                                 value=int(selected_item["quantity"]),
                                 key=f"edit_quantity_{selected_item_id}"
                             )
+                            edit_cost = st.number_input(
+                                "Inventory Cost",
+                                min_value=0.0,
+                                step=0.01,
+                                value=float(selected_item["cost"]) if "cost" in selected_item and pd.notna(selected_item["cost"]) else 0.0,
+                                format="%.2f",
+                                key=f"edit_cost_{selected_item_id}"
+                            )
 
                             update_item = st.form_submit_button(
                                 "Update Item",
@@ -2641,7 +3513,7 @@ else:
                                     c.execute(
                                         '''
                                         UPDATE inventory
-                                        SET item_code=?, item_name=?, description=?, quantity=?
+                                        SET item_code=?, item_name=?, description=?, quantity=?, cost=?
                                         WHERE id=?
                                         ''',
                                         (
@@ -2649,40 +3521,13 @@ else:
                                             edit_item_name.strip(),
                                             edit_description.strip(),
                                             edit_quantity,
+                                            float(edit_cost),
                                             selected_item_id
                                         )
                                     )
 
                                     if old_item_code != new_item_code:
-                                        c.execute(
-                                            '''
-                                            SELECT username, quantity
-                                            FROM user_inventory
-                                            WHERE item_code=?
-                                            ''',
-                                            (old_item_code,)
-                                        )
-                                        old_user_stock_rows = c.fetchall()
-
-                                        for stock_username, stock_quantity in old_user_stock_rows:
-                                            c.execute(
-                                                '''
-                                                INSERT INTO user_inventory (username,item_code,quantity)
-                                                VALUES (?,?,?)
-                                                ON CONFLICT(username,item_code)
-                                                DO UPDATE SET quantity=user_inventory.quantity + excluded.quantity
-                                                ''',
-                                                (stock_username, new_item_code, int(stock_quantity))
-                                            )
-
-                                        c.execute(
-                                            "DELETE FROM user_inventory WHERE item_code=?",
-                                            (old_item_code,)
-                                        )
-                                        c.execute(
-                                            "UPDATE transactions SET item_code=? WHERE item_code=?",
-                                            (new_item_code, old_item_code)
-                                        )
+                                        update_item_code_references(c, old_item_code, new_item_code)
 
                                     conn.commit()
                                     st.session_state.inventory_message = "Inventory record updated successfully. Related user stock and transaction item codes were synchronized when needed."
@@ -2721,10 +3566,7 @@ else:
                         ):
                             conn = get_connection()
                             c = conn.cursor()
-                            c.execute(
-                                "DELETE FROM user_inventory WHERE item_code=?",
-                                (str(selected_item["item_code"]),)
-                            )
+                            delete_item_code_references(c, str(selected_item["item_code"]))
                             c.execute(
                                 "DELETE FROM inventory WHERE id=?",
                                 (int(selected_item["id"]),)
@@ -3050,8 +3892,9 @@ else:
             )
             product_assignments_df = pd.read_sql_query(
                 '''
-                SELECT ps.id, ps.username, i.item_code, i.item_name
+                SELECT ps.id, ps.username, u.role, i.item_code, i.item_name
                 FROM product_suppliers ps
+                LEFT JOIN users u ON ps.username = u.username
                 LEFT JOIN inventory i ON ps.item_code = i.item_code
                 ORDER BY ps.username, i.item_name
                 ''',
@@ -3060,19 +3903,19 @@ else:
             conn.close()
 
             st.markdown("---")
-            st.markdown('<div class="dashboard-section-title">Assign Supplied Products</div>', unsafe_allow_html=True)
+            st.markdown('<div class="dashboard-section-title">Assign Inventory Products</div>', unsafe_allow_html=True)
 
-            supplier_admins_df = users_df[users_df["role"] == "admin"].copy()
+            assignable_product_users_df = users_df[users_df["role"].isin(["admin", "sales"])].copy()
 
-            if supplier_admins_df.empty or inventory_df.empty:
-                st.info("Create at least one admin account and one inventory item before assigning supplied products.")
+            if assignable_product_users_df.empty or inventory_df.empty:
+                st.info("Create at least one admin or sales account and one inventory item before assigning products.")
             else:
                 supplier_col, supplier_table_col = st.columns([0.9, 1.1])
 
                 with supplier_col:
                     supplier_username = st.selectbox(
-                        "Admin / Supplier",
-                        supplier_admins_df["username"].tolist(),
+                        "Admin or Sales User",
+                        assignable_product_users_df["username"].tolist(),
                         key="supplier_assignment_user"
                     )
                     supplier_item_options = {
@@ -3101,10 +3944,10 @@ else:
                                     (supplier_username, supplier_item_options[supplier_item])
                                 )
                                 conn.commit()
-                                st.success("Supplied product assignment saved. This admin can now see financial and return data for that product.")
+                                st.success("Product assignment saved for the selected admin or sales user.")
                                 st.rerun()
                             except sqlite3.IntegrityError:
-                                st.info("This supplied product is already assigned to the selected admin.")
+                                st.info("This product is already assigned to the selected user.")
                             finally:
                                 conn.close()
 
@@ -3121,12 +3964,12 @@ else:
                             )
                             conn.commit()
                             conn.close()
-                            st.success("Supplied product assignment removed. The admin will no longer see that product's related records.")
+                            st.success("Product assignment removed for the selected user.")
                             st.rerun()
 
                 with supplier_table_col:
                     if product_assignments_df.empty:
-                        st.info("No supplied product assignments exist yet. Assign products so admins can see their related invoices, payments, and returns.")
+                        st.info("No product assignments exist yet. Assign products to admins or sales users to scope product access.")
                     else:
                         st.dataframe(
                             product_assignments_df,
@@ -3134,7 +3977,8 @@ else:
                             hide_index=True,
                             column_config={
                                 "id": "ID",
-                                "username": "Admin / Supplier",
+                                "username": "User",
+                                "role": "Role",
                                 "item_code": "Item Code",
                                 "item_name": "Item Name",
                             }
@@ -3225,7 +4069,18 @@ else:
                 st.info("No storage locations have been created yet. Ruth can create the first location from the form on the left.")
             else:
                 display_locations_df = locations_df.copy()
-                display_locations_df["active"] = display_locations_df["active"].map({1: "Active", 0: "Inactive"})
+                display_locations_df["status"] = display_locations_df["active"].map({1: "Active", 0: "Inactive"})
+                location_status_filter = st.selectbox(
+                    "Filter Location Status",
+                    ["All", "Active", "Inactive"],
+                    key="location_status_filter"
+                )
+
+                if location_status_filter != "All":
+                    display_locations_df = display_locations_df[
+                        display_locations_df["status"] == location_status_filter
+                    ].copy()
+
                 st.dataframe(
                     display_locations_df,
                     width="stretch",
@@ -3235,7 +4090,8 @@ else:
                         "name": "Location",
                         "address": "Address / Notes",
                         "owner_username": "Owner/Admin",
-                        "active": "Status",
+                        "active": None,
+                        "status": "Status",
                         "created_at": "Created",
                     }
                 )
@@ -3436,7 +4292,10 @@ else:
             st.markdown('<div class="dashboard-section-title">Set Location Stock / Price</div>', unsafe_allow_html=True)
 
             if locations_df.empty or inventory_df.empty:
-                st.info("No active locations are available for your account. Ruth must assign you to an active location first.")
+                show_next_step(
+                    "No active locations are available for your account.",
+                    "Ruth should open Locations and assign your account to an active location."
+                )
             else:
                 location_options = {
                     f"{row['name']} (ID {row['id']})": int(row["id"])
@@ -3486,22 +4345,57 @@ else:
             st.markdown('<div class="dashboard-section-title">All Location Stock</div>', unsafe_allow_html=True)
 
             if location_stock_df.empty:
-                st.info("No location inventory records exist yet. Add stock and pricing for a location to populate this table.")
-            else:
-                st.dataframe(
-                    location_stock_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "location_id": None,
-                        "location": "Location",
-                        "item_code": "Item Code",
-                        "item_name": "Item Name",
-                        "quantity": "Quantity",
-                        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
-                    }
+                show_next_step(
+                    "No location inventory records exist yet.",
+                    "Select a location and item on the left, then save quantity and price."
                 )
+            else:
+                stock_filter_col1, stock_filter_col2 = st.columns(2)
+                with stock_filter_col1:
+                    stock_location_filter = st.selectbox(
+                        "Filter Location",
+                        ["All"] + sorted(location_stock_df["location"].dropna().unique().tolist()),
+                        key="location_stock_filter"
+                    )
+                with stock_filter_col2:
+                    stock_status_filter = st.selectbox(
+                        "Stock Status",
+                        ["All", "In stock", "Low stock", "Out of stock"],
+                        key="location_stock_status_filter"
+                    )
+
+                stock_display_df = location_stock_df.copy()
+                stock_display_df["stock_status"] = stock_display_df["quantity"].apply(stock_status)
+
+                if stock_location_filter != "All":
+                    stock_display_df = stock_display_df[
+                        stock_display_df["location"] == stock_location_filter
+                    ].copy()
+
+                if stock_status_filter != "All":
+                    stock_display_df = stock_display_df[
+                        stock_display_df["stock_status"] == stock_status_filter
+                    ].copy()
+
+                if stock_display_df.empty:
+                    st.info("No location stock records match the selected filters.")
+                else:
+                    stock_display_df = stock_display_df[
+                        ["location", "item_code", "item_name", "quantity", "stock_status", "price"]
+                    ]
+                    st.dataframe(
+                        stock_display_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "location": "Location",
+                            "item_code": "Item Code",
+                            "item_name": "Item Name",
+                            "quantity": "Quantity",
+                            "stock_status": "Stock Status",
+                            "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                        }
+                    )
 
     if menu == "Financials" and has_admin_access():
         conn = get_connection()
@@ -3641,17 +4535,36 @@ else:
                 if is_super_admin():
                     st.info("Create at least one active location and one inventory item before creating invoices.")
                 elif locations_df.empty and inventory_df.empty:
-                    st.info("Ruth must assign this admin to at least one location and one supplied product before this admin can create invoices.")
+                    show_next_step(
+                        "This admin is missing both location access and supplied-product access.",
+                        "Ruth should assign a location in Locations, then assign supplied products in User Management."
+                    )
                 elif locations_df.empty:
-                    st.info("Ruth must assign this admin to at least one active location before this admin can create invoices.")
+                    show_next_step(
+                        "This admin is not assigned to an active location.",
+                        "Ruth should open Locations and assign this admin to the correct storage location."
+                    )
                 else:
-                    st.info("Ruth must assign supplied products to this admin before this admin can create invoices.")
+                    show_next_step(
+                        "This admin has no supplied products assigned.",
+                        "Ruth should open User Management and assign the products this admin supplies."
+                    )
             else:
                 location_options = {
                     f"{row['name']} (ID {row['id']})": int(row["id"])
                     for _, row in locations_df.iterrows()
                 }
 
+                st.markdown(
+                    """
+                    <div class="workflow-panel">
+                        <div class="workflow-kicker">Step 1</div>
+                        <div class="workflow-title">Select Location</div>
+                        <div class="workflow-text">Choose the location this invoice will come from. The item list updates to show only stock available at that location.</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
                 invoice_location = st.selectbox(
                     "Location",
                     list(location_options.keys()),
@@ -3683,9 +4596,15 @@ else:
 
                 if available_items_df.empty:
                     if not location_has_stock:
-                        st.info("The selected location has no available stock yet. Add stock in Location Inventory or choose another location.")
+                        show_next_step(
+                            "The selected location has no available stock yet.",
+                            "Add stock and pricing in Location Inventory, or choose another location."
+                        )
                     elif not is_super_admin():
-                        st.info("This location has stock, but none of the stocked items are assigned to this admin as supplied products. Ruth can assign the product in User Management, or you can choose another location.")
+                        show_next_step(
+                            "This location has stock, but none of those items are assigned to this admin as supplied products.",
+                            "Ruth should assign the stocked product to this admin in User Management, or choose another location."
+                        )
                     else:
                         st.info("The selected location has stock, but none of the stocked items match the current invoice product list. Check Location Inventory and the master inventory list.")
                 else:
@@ -3694,6 +4613,16 @@ else:
                         row["item_code"]
                         for _, row in available_items_df.iterrows()
                     }
+                    st.markdown(
+                        """
+                        <div class="workflow-panel">
+                            <div class="workflow-kicker">Step 2</div>
+                            <div class="workflow-title">Select Item</div>
+                            <div class="workflow-text">Pick an item from the selected location. The default price comes from that location's pricing setup.</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                     invoice_item = st.selectbox(
                         "Item",
                         list(item_options.keys()),
@@ -3708,25 +4637,67 @@ else:
                     create_invoice = False
 
                     with st.form(f"create_invoice_form_{location_id}_{item_code}"):
+                        st.markdown(
+                            """
+                            <div class="workflow-kicker">Step 3</div>
+                            <div class="workflow-title">Confirm Invoice Details</div>
+                            """,
+                            unsafe_allow_html=True
+                        )
                         st.caption(
                             f"Available at this location: {available_quantity} unit(s). "
                             f"Default location price: ${default_unit_price:.2f}."
                         )
-                        customer_name = st.text_input("Customer / Company Name")
-                        invoice_quantity = st.number_input(
-                            "Quantity",
-                            min_value=1,
-                            max_value=max(available_quantity, 1),
-                            step=1,
-                            key=f"invoice_quantity_{location_id}_{item_code}"
+                        st.markdown(
+                            '<div class="modern-form-note">Add the customer, quantity, and price for this location invoice.</div>',
+                            unsafe_allow_html=True
                         )
-                        invoice_unit_price = st.number_input(
-                            "Unit Price",
-                            min_value=0.0,
-                            value=default_unit_price,
-                            step=0.01,
-                            format="%.2f",
-                            key=f"invoice_unit_price_{location_id}_{item_code}"
+                        customer_name = st.text_input(
+                            "Customer Name",
+                            placeholder="Customer or company name"
+                        )
+                        quantity_col, price_col = st.columns(2)
+                        with quantity_col:
+                            invoice_quantity = st.number_input(
+                                "Quantity",
+                                min_value=1,
+                                max_value=max(available_quantity, 1),
+                                step=1,
+                                key=f"invoice_quantity_{location_id}_{item_code}"
+                            )
+                        with price_col:
+                            invoice_unit_price = st.number_input(
+                                "Unit Price",
+                                min_value=0.0,
+                                value=default_unit_price,
+                                step=0.01,
+                                format="%.2f",
+                                key=f"invoice_unit_price_{location_id}_{item_code}"
+                            )
+
+                        invoice_total_preview = int(invoice_quantity) * float(invoice_unit_price)
+                        invoice_stock_after = max(available_quantity - int(invoice_quantity), 0)
+                        st.markdown(
+                            f"""
+                            <div class="modern-form-summary">
+                                <div class="modern-form-summary-title">Invoice Preview</div>
+                                <div class="modern-form-summary-grid">
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Available</div>
+                                        <div class="modern-form-summary-value">{available_quantity} units</div>
+                                    </div>
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Invoice Total</div>
+                                        <div class="modern-form-summary-value">${invoice_total_preview:,.2f}</div>
+                                    </div>
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Stock After</div>
+                                        <div class="modern-form-summary-value">{invoice_stock_after} units</div>
+                                    </div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
                         )
                         create_invoice = st.form_submit_button("Create Invoice", type="primary", width="stretch")
 
@@ -3795,6 +4766,24 @@ else:
                                         invoice_total
                                     )
                                 )
+                                c.execute(
+                                    '''
+                                    INSERT INTO transactions
+                                    (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                    VALUES (?,?,?,?,?,?,?,?,?)
+                                    ''',
+                                    (
+                                        st.session_state.username,
+                                        item_code,
+                                        quantity_int,
+                                        current_available_quantity,
+                                        current_available_quantity - quantity_int,
+                                        "sale",
+                                        "location_stock",
+                                        location_id,
+                                        now
+                                    )
+                                )
                                 conn.commit()
                                 st.success(f"Invoice {invoice_number} created successfully. Location inventory was reduced automatically.")
                                 st.rerun()
@@ -3805,7 +4794,10 @@ else:
             st.markdown('<div class="dashboard-section-title">Record Payment</div>', unsafe_allow_html=True)
 
             if invoices_df.empty:
-                st.info("Create at least one invoice before recording customer payments.")
+                show_next_step(
+                    "No accessible invoices are available for payment recording.",
+                    "Create an invoice first, then return here to record the customer payment."
+                )
             else:
                 invoice_options = {
                     f"{row['invoice_number']} - {row['customer_name']} (${float(row['outstanding']):,.2f} due)": int(row["id"])
@@ -3827,59 +4819,109 @@ else:
                         invoice_id = invoice_options[selected_invoice]
                         conn = get_connection()
                         c = conn.cursor()
-                        c.execute(
-                            '''
-                            INSERT INTO payments
-                            (invoice_id,amount,payment_method,reference_number,received_by,paid_at)
-                            VALUES (?,?,?,?,?,?)
-                            ''',
-                            (
-                                invoice_id,
-                                float(payment_amount),
-                                payment_method,
-                                reference_number.strip(),
-                                st.session_state.username,
-                                now
+                        outstanding_balance = get_invoice_balance(c, invoice_id)
+
+                        if outstanding_balance is None:
+                            conn.close()
+                            st.error("The selected invoice could not be found. Refresh and try again.")
+                        elif float(payment_amount) > outstanding_balance:
+                            conn.close()
+                            st.error(f"Payment cannot exceed the outstanding balance of ${outstanding_balance:,.2f}.")
+                        else:
+                            c.execute(
+                                '''
+                                INSERT INTO payments
+                                (invoice_id,amount,payment_method,reference_number,received_by,paid_at)
+                                VALUES (?,?,?,?,?,?)
+                                ''',
+                                (
+                                    invoice_id,
+                                    float(payment_amount),
+                                    payment_method,
+                                    reference_number.strip(),
+                                    st.session_state.username,
+                                    now
+                                )
                             )
-                        )
-                        c.execute(
-                            '''
-                            SELECT inv.total - COALESCE(SUM(p.amount), 0)
-                            FROM invoices inv
-                            LEFT JOIN payments p ON p.invoice_id = inv.id
-                            WHERE inv.id=?
-                            GROUP BY inv.id
-                            ''',
-                            (invoice_id,)
-                        )
-                        outstanding_row = c.fetchone()
-                        if outstanding_row and float(outstanding_row[0]) <= 0:
-                            c.execute("UPDATE invoices SET status='paid' WHERE id=?", (invoice_id,))
-                        conn.commit()
-                        conn.close()
-                        st.success("Payment recorded successfully. Invoice status was updated if the balance is fully paid.")
-                        st.rerun()
+                            if outstanding_balance - float(payment_amount) <= 0:
+                                c.execute("UPDATE invoices SET status='paid' WHERE id=?", (invoice_id,))
+                            conn.commit()
+                            conn.close()
+                            st.success("Payment recorded successfully. Invoice status was updated if the balance is fully paid.")
+                            st.rerun()
 
         st.markdown('<div class="dashboard-section-title">Invoices</div>', unsafe_allow_html=True)
         if invoices_df.empty:
             st.info("No invoices have been created for the records you can access yet.")
         else:
+            invoice_filter_col1, invoice_filter_col2 = st.columns([1.3, 0.7])
+            with invoice_filter_col1:
+                invoice_search = st.text_input(
+                    "Search invoices",
+                    placeholder="Search invoice, customer, location, or item",
+                    key="invoice_table_search"
+                )
+            with invoice_filter_col2:
+                invoice_status_filter = st.selectbox(
+                    "Is Paid",
+                    ["All", "Yes", "No", "Partially Paid"],
+                    key="invoice_status_filter"
+                )
+
+            invoice_display_df = invoices_df.copy()
+            invoice_display_df["status_label"] = invoice_display_df.apply(
+                lambda row: is_paid_label(row["total"], row["paid"], row["outstanding"]),
+                axis=1
+            )
+
+            if invoice_search:
+                invoice_search_value = invoice_search.lower().strip()
+                invoice_display_df = invoice_display_df[
+                    invoice_display_df["invoice_number"].fillna("").str.lower().str.contains(invoice_search_value)
+                    | invoice_display_df["customer_name"].fillna("").str.lower().str.contains(invoice_search_value)
+                    | invoice_display_df["location"].fillna("").str.lower().str.contains(invoice_search_value)
+                    | invoice_display_df["item_codes"].fillna("").str.lower().str.contains(invoice_search_value)
+                ].copy()
+
+            if invoice_status_filter != "All":
+                invoice_display_df = invoice_display_df[
+                    invoice_display_df["status_label"] == invoice_status_filter
+                ].copy()
+
+            if invoice_display_df.empty:
+                st.info("No invoices match the selected search or status filter.")
+            else:
+                invoice_display_df["balance_status"] = invoice_display_df["status_label"]
+                invoice_display_df["total_display"] = invoice_display_df["total"].apply(format_currency)
+                invoice_display_df["paid_display"] = invoice_display_df["paid"].apply(format_currency)
+                invoice_display_df["outstanding_display"] = invoice_display_df["outstanding"].apply(format_currency)
+                invoice_display_df = invoice_display_df[
+                    [
+                        "invoice_number",
+                        "location",
+                        "item_codes",
+                        "customer_name",
+                        "total_display",
+                        "paid_display",
+                        "outstanding_display",
+                        "balance_status",
+                        "created_at",
+                    ]
+                ]
+
             st.dataframe(
-                invoices_df,
+                invoice_display_df,
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "id": "ID",
-                    "location_id": None,
-                    "item_codes": None,
                     "invoice_number": "Invoice",
                     "location": "Location",
+                    "item_codes": "Items",
                     "customer_name": "Customer",
-                    "created_by": "Created By",
-                    "total": st.column_config.NumberColumn("Total", format="$%.2f"),
-                    "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
-                    "outstanding": st.column_config.NumberColumn("Outstanding", format="$%.2f"),
-                    "status": "Status",
+                    "total_display": "Total",
+                    "paid_display": "Paid",
+                    "outstanding_display": "Outstanding",
+                    "balance_status": "Is Paid",
                     "created_at": "Created",
                 }
             )
@@ -3888,22 +4930,64 @@ else:
         if payments_df.empty:
             st.info("No payments have been recorded for the records you can access yet.")
         else:
-            st.dataframe(
-                payments_df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "id": "ID",
-                    "location_id": None,
-                    "item_codes": None,
-                    "invoice_number": "Invoice",
-                    "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
-                    "payment_method": "Method",
-                    "reference_number": "Reference",
-                    "received_by": "Received By",
-                    "paid_at": "Paid At",
-                }
-            )
+            payment_filter_col1, payment_filter_col2 = st.columns([1.3, 0.7])
+            with payment_filter_col1:
+                payment_search = st.text_input(
+                    "Search payments",
+                    placeholder="Search invoice, method, reference, or receiver",
+                    key="payment_table_search"
+                )
+            with payment_filter_col2:
+                payment_method_filter = st.selectbox(
+                    "Payment Method",
+                    ["All", "cash", "check", "wire", "credit_card"],
+                    key="payment_method_filter"
+                )
+
+            payment_display_df = payments_df.copy()
+
+            if payment_search:
+                payment_search_value = payment_search.lower().strip()
+                payment_display_df = payment_display_df[
+                    payment_display_df["invoice_number"].fillna("").str.lower().str.contains(payment_search_value)
+                    | payment_display_df["payment_method"].fillna("").str.lower().str.contains(payment_search_value)
+                    | payment_display_df["reference_number"].fillna("").str.lower().str.contains(payment_search_value)
+                    | payment_display_df["received_by"].fillna("").str.lower().str.contains(payment_search_value)
+                ].copy()
+
+            if payment_method_filter != "All":
+                payment_display_df = payment_display_df[
+                    payment_display_df["payment_method"] == payment_method_filter
+                ].copy()
+
+            if payment_display_df.empty:
+                st.info("No payments match the selected search or method filter.")
+            else:
+                payment_display_df["amount_display"] = payment_display_df["amount"].apply(format_currency)
+                payment_display_df = payment_display_df[
+                    [
+                        "invoice_number",
+                        "amount_display",
+                        "payment_method",
+                        "reference_number",
+                        "received_by",
+                        "paid_at",
+                    ]
+                ]
+
+                st.dataframe(
+                    payment_display_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "invoice_number": "Invoice",
+                        "amount_display": "Amount",
+                        "payment_method": "Method",
+                        "reference_number": "Reference",
+                        "received_by": "Received By",
+                        "paid_at": "Paid At",
+                    }
+                )
 
     if menu == "Returns" and (has_admin_access() or get_current_role() == "sales"):
         conn = get_connection()
@@ -3953,7 +5037,10 @@ else:
             st.markdown('<div class="dashboard-section-title">Record Return</div>', unsafe_allow_html=True)
 
             if locations_df.empty or inventory_df.empty:
-                st.info("No active locations are available for your account. Ruth must assign you to an active location before returns can be recorded.")
+                show_next_step(
+                    "No active locations are available for your account.",
+                    "Ruth should assign your account to an active location before returns can be recorded."
+                )
             else:
                 location_options = {
                     f"{row['name']} (ID {row['id']})": int(row["id"])
@@ -4006,24 +5093,64 @@ else:
             if returns_df.empty:
                 st.info("No returned or damaged items have been recorded for the records you can access yet.")
             else:
-                st.dataframe(
-                    returns_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "location_id": None,
-                        "location": "Location",
-                        "item_code": "Item Code",
-                        "item_name": "Item Name",
-                        "quantity": "Quantity",
-                        "reason": "Reason",
-                        "condition_status": "Condition",
-                        "recorded_by": "Recorded By",
-                        "status": "Status",
-                        "created_at": "Created",
-                    }
-                )
+                return_filter_col1, return_filter_col2 = st.columns(2)
+                with return_filter_col1:
+                    return_location_filter = st.selectbox(
+                        "Filter Location",
+                        ["All"] + sorted(returns_df["location"].dropna().unique().tolist()),
+                        key="return_location_filter"
+                    )
+                with return_filter_col2:
+                    return_condition_filter = st.selectbox(
+                        "Condition",
+                        ["All"] + sorted(returns_df["condition_status"].dropna().unique().tolist()),
+                        key="return_condition_filter"
+                    )
+
+                return_display_df = returns_df.copy()
+
+                if return_location_filter != "All":
+                    return_display_df = return_display_df[
+                        return_display_df["location"] == return_location_filter
+                    ].copy()
+
+                if return_condition_filter != "All":
+                    return_display_df = return_display_df[
+                        return_display_df["condition_status"] == return_condition_filter
+                    ].copy()
+
+                if return_display_df.empty:
+                    st.info("No return records match the selected filters.")
+                else:
+                    return_display_df = return_display_df[
+                        [
+                            "location",
+                            "item_code",
+                            "item_name",
+                            "quantity",
+                            "condition_status",
+                            "status",
+                            "recorded_by",
+                            "created_at",
+                            "reason",
+                        ]
+                    ]
+                    st.dataframe(
+                        return_display_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "location": "Location",
+                            "item_code": "Item Code",
+                            "item_name": "Item Name",
+                            "quantity": "Quantity",
+                            "reason": "Reason",
+                            "condition_status": "Condition",
+                            "recorded_by": "Recorded By",
+                            "status": "Status",
+                            "created_at": "Created",
+                        }
+                    )
 
     if menu == "Transfers" and has_admin_access():
         conn = get_connection()
@@ -4070,7 +5197,10 @@ else:
             st.markdown('<div class="dashboard-section-title">Create Transfer</div>', unsafe_allow_html=True)
 
             if len(locations_df) < 2 or inventory_df.empty:
-                st.info("At least two active assigned locations and one inventory item are required before recording transfers.")
+                show_next_step(
+                    "Transfers require at least two active assigned locations and one inventory item.",
+                    "Ruth should assign another location, or add inventory before creating a transfer."
+                )
             else:
                 location_options = {
                     f"{row['name']} (ID {row['id']})": int(row["id"])
@@ -4169,32 +5299,85 @@ else:
             if transfers_df.empty:
                 st.info("No inventory transfers have been recorded for the locations you can access yet.")
             else:
-                st.dataframe(
-                    transfers_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "source_location_id": None,
-                        "destination_location_id": None,
-                        "item_code": "Item Code",
-                        "item_name": "Item Name",
-                        "source_location": "From",
-                        "destination_location": "To",
-                        "quantity": "Quantity",
-                        "requested_by": "Requested By",
-                        "approved_by": "Approved By",
-                        "status": "Status",
-                        "created_at": "Created",
-                        "completed_at": "Completed",
-                    }
-                )
+                transfer_filter_col1, transfer_filter_col2 = st.columns(2)
+                with transfer_filter_col1:
+                    transfer_location_options = sorted(
+                        set(transfers_df["source_location"].dropna().tolist())
+                        | set(transfers_df["destination_location"].dropna().tolist())
+                    )
+                    transfer_location_filter = st.selectbox(
+                        "Filter Location",
+                        ["All"] + transfer_location_options,
+                        key="transfer_location_filter"
+                    )
+                with transfer_filter_col2:
+                    transfer_status_filter = st.selectbox(
+                        "Transfer Status",
+                        ["All"] + sorted(transfers_df["status"].dropna().unique().tolist()),
+                        key="transfer_status_filter"
+                    )
+
+                transfer_display_df = transfers_df.copy()
+
+                if transfer_location_filter != "All":
+                    transfer_display_df = transfer_display_df[
+                        (transfer_display_df["source_location"] == transfer_location_filter)
+                        | (transfer_display_df["destination_location"] == transfer_location_filter)
+                    ].copy()
+
+                if transfer_status_filter != "All":
+                    transfer_display_df = transfer_display_df[
+                        transfer_display_df["status"] == transfer_status_filter
+                    ].copy()
+
+                if transfer_display_df.empty:
+                    st.info("No transfer records match the selected filters.")
+                else:
+                    transfer_display_df["route"] = (
+                        transfer_display_df["source_location"].fillna("Unknown")
+                        + " -> "
+                        + transfer_display_df["destination_location"].fillna("Unknown")
+                    )
+                    transfer_display_df = transfer_display_df[
+                        [
+                            "item_code",
+                            "item_name",
+                            "route",
+                            "quantity",
+                            "status",
+                            "requested_by",
+                            "approved_by",
+                            "created_at",
+                            "completed_at",
+                        ]
+                    ]
+                    st.dataframe(
+                        transfer_display_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "item_code": "Item Code",
+                            "item_name": "Item Name",
+                            "route": "Route",
+                            "quantity": "Quantity",
+                            "requested_by": "Requested By",
+                            "approved_by": "Approved By",
+                            "status": "Status",
+                            "created_at": "Created",
+                            "completed_at": "Completed",
+                        }
+                    )
 
     if menu == "Manage Sales" and is_super_admin():
 
         conn = get_connection()
         sales_df = pd.read_sql_query(
-            "SELECT * FROM transactions ORDER BY id DESC",
+            '''
+            SELECT t.*, COALESCE(l.name, 'User Account') AS location
+            FROM transactions t
+            LEFT JOIN locations l ON l.id = t.location_id
+            ORDER BY t.id DESC
+            ''',
             conn
         )
         conn.close()
@@ -4204,7 +5387,7 @@ else:
             <div class="page-header">
                 <div class="page-eyebrow">Admin</div>
                 <div class="page-title">Manage Sales</div>
-                <p class="page-subtitle">Review user sales activity, item movement, and quantity sold from existing transaction records.</p>
+                <p class="page-subtitle">Review sales activity, item movement, location, and quantity sold from transaction records.</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -4282,7 +5465,7 @@ else:
                 )
 
             st.markdown('<div class="dashboard-section-title">Sales Filters</div>', unsafe_allow_html=True)
-            filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1.2])
+            filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1, 1, 1, 1.2])
 
             with filter_col1:
                 user_options = ["All Users"] + sorted(sales_df["username"].dropna().unique().tolist())
@@ -4293,6 +5476,10 @@ else:
                 selected_item = st.selectbox("Item Code", item_options, key="sales_item_filter")
 
             with filter_col3:
+                location_options = ["All Locations"] + sorted(sales_df["location"].dropna().unique().tolist())
+                selected_location = st.selectbox("Location", location_options, key="sales_location_filter")
+
+            with filter_col4:
                 valid_dates = sales_df["sale_date"].dropna()
                 if valid_dates.empty:
                     selected_dates = None
@@ -4312,13 +5499,16 @@ else:
             if selected_item != "All Items":
                 filtered_sales_df = filtered_sales_df[filtered_sales_df["item_code"] == selected_item]
 
+            if selected_location != "All Locations":
+                filtered_sales_df = filtered_sales_df[filtered_sales_df["location"] == selected_location]
+
             if selected_dates and len(selected_dates) == 2:
                 start_date, end_date = selected_dates
                 filtered_sales_df = filtered_sales_df[
                     filtered_sales_df["sale_date"].dt.date.between(start_date, end_date)
                 ]
 
-            summary_col1, summary_col2 = st.columns([1, 1])
+            summary_col1, summary_col2, summary_col3 = st.columns([1, 1, 1])
 
             with summary_col1:
                 st.markdown('<div class="dashboard-section-title">Sales by Item</div>', unsafe_allow_html=True)
@@ -4360,6 +5550,26 @@ else:
                         }
                     )
 
+            with summary_col3:
+                st.markdown('<div class="dashboard-section-title">Sales by Location</div>', unsafe_allow_html=True)
+                if filtered_sales_df.empty:
+                    st.info("No location sales match the selected filters. Adjust the filters to broaden the results.")
+                else:
+                    location_sales_df = (
+                        filtered_sales_df.groupby("location", as_index=False)["quantity_used"]
+                        .sum()
+                        .sort_values("quantity_used", ascending=False)
+                    )
+                    st.dataframe(
+                        location_sales_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "location": "Location",
+                            "quantity_used": "Quantity Sold",
+                        }
+                    )
+
             st.markdown('<div class="dashboard-section-title">Sales Records</div>', unsafe_allow_html=True)
 
             if filtered_sales_df.empty:
@@ -4377,13 +5587,14 @@ else:
                     filtered_sales_df = filtered_sales_df[
                         filtered_sales_df["username"].str.lower().str.contains(sales_record_search, na=False)
                         | filtered_sales_df["item_code"].str.lower().str.contains(sales_record_search, na=False)
+                        | filtered_sales_df["location"].str.lower().str.contains(sales_record_search, na=False)
                     ]
 
                 if filtered_sales_df.empty:
                     st.info("No sales records match the search text. Try a different user or item code.")
                 else:
                     records_df = filtered_sales_df[
-                        ["id", "username", "item_code", "quantity_before", "quantity_used", "quantity_after", "transaction_time"]
+                        ["id", "username", "location", "item_code", "quantity_before", "quantity_used", "quantity_after", "transaction_time"]
                     ].copy()
                     st.dataframe(
                         records_df,
@@ -4392,10 +5603,11 @@ else:
                         column_config={
                             "id": "ID",
                             "username": "Sales User",
+                            "location": "Location",
                             "item_code": "Item Code",
-                            "quantity_before": "User Qty Before Sale",
+                            "quantity_before": "Qty Before Sale",
                             "quantity_used": "Quantity Sold",
-                            "quantity_after": "User Qty After Sale",
+                            "quantity_after": "Qty After Sale",
                             "transaction_time": "Sale Time",
                         }
                     )
@@ -4456,13 +5668,36 @@ else:
         st.markdown(
             """
             <div class="page-header">
-                <div class="page-eyebrow">Inventory Lookup</div>
-                <div class="page-title">Scan Inventory</div>
-                <p class="page-subtitle">Enter an item code to review stock details before selling or checking inventory.</p>
+                <div class="page-eyebrow">Manual Stock Entry</div>
+                <div class="page-title">Receive Stock</div>
+                <p class="page-subtitle">Choose a location and available item to receive stock into a sales or user account.</p>
             </div>
             """,
             unsafe_allow_html=True
         )
+
+        assigned_location_ids = get_assigned_location_ids()
+        supplied_item_codes = set(get_supplied_item_codes())
+        conn = get_connection()
+        manual_locations_df = pd.read_sql_query(
+            "SELECT id, name, address FROM locations WHERE active=1 ORDER BY name",
+            conn
+        )
+        manual_inventory_df = pd.read_sql_query(
+            "SELECT item_code, item_name, description, quantity FROM inventory WHERE quantity > 0 ORDER BY item_name",
+            conn
+        )
+        conn.close()
+
+        if get_current_role() == "sales":
+            manual_locations_df = manual_locations_df[
+                manual_locations_df["id"].isin(assigned_location_ids)
+            ].copy()
+
+        if supplied_item_codes:
+            manual_inventory_df = manual_inventory_df[
+                manual_inventory_df["item_code"].isin(supplied_item_codes)
+            ].copy()
 
         lookup_col, detail_col = st.columns([0.9, 1.1])
 
@@ -4476,35 +5711,67 @@ else:
                 """
                 <div class="workflow-panel">
                     <div class="workflow-kicker">Step 1</div>
-                    <div class="workflow-title">Find Inventory Item</div>
-                    <div class="workflow-text">Enter the item code from the QR label. After the item loads, choose how many units to add to your stock.</div>
+                    <div class="workflow-title">Manual Stock Entry</div>
+                    <div class="workflow-text">Select the location and item being received. Scanned QR codes still prefill the item when available.</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            with st.form("scan_inventory_lookup_form"):
-                scan_lookup_code = st.text_input(
-                    "Item Code",
-                    key="scan_lookup_code",
-                    placeholder="Enter item code, for example 123"
-                )
-                lookup_submitted = st.form_submit_button(
-                    "View Item Details",
-                    type="primary",
-                    width="stretch"
-                )
+            if manual_locations_df.empty:
+                st.info("No active location is available for this account.")
+            elif manual_inventory_df.empty:
+                st.info("No available inventory items are ready to receive for this account.")
+            else:
+                location_options = {
+                    f"{row['name']} - {row['address'] or 'No address'}": int(row["id"])
+                    for _, row in manual_locations_df.iterrows()
+                }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available": row["item_code"]
+                    for _, row in manual_inventory_df.iterrows()
+                }
 
-            if lookup_submitted:
-                st.session_state.scan_selected_item_code = scan_lookup_code.strip()
+                with st.form("scan_inventory_lookup_form"):
+                    selected_manual_location = st.selectbox(
+                        "Location",
+                        list(location_options.keys()),
+                        key="manual_receive_location"
+                    )
+                    selected_manual_item = st.selectbox(
+                        "Available Item",
+                        list(item_options.keys()),
+                        key="manual_receive_item"
+                    )
+                    scan_lookup_code = st.text_input(
+                        "Scanned or Typed Item Code",
+                        key="scan_lookup_code",
+                        placeholder="Optional QR/barcode item code"
+                    )
+                    lookup_submitted = st.form_submit_button(
+                        "View Item Details",
+                        type="primary",
+                        width="stretch"
+                    )
+
+                if lookup_submitted:
+                    selected_item_code = scan_lookup_code.strip() or item_options[selected_manual_item]
+                    st.session_state.scan_selected_item_code = selected_item_code
+                    st.session_state.scan_selected_location_id = location_options[selected_manual_location]
 
             item_code = st.session_state.get("scan_selected_item_code", "").strip()
+            selected_location_id = st.session_state.get("scan_selected_location_id")
+            allowed_manual_item_codes = set(manual_inventory_df["item_code"].astype(str).tolist())
+            if item_code and item_code not in allowed_manual_item_codes:
+                st.session_state.pop("scan_selected_item_code", None)
+                item_code = ""
+                st.warning("That item is not available for this account. Choose an item from the available-item dropdown.")
 
         with detail_col:
             st.markdown('<div class="dashboard-section-title">Receive Stock</div>', unsafe_allow_html=True)
 
             if not item_code:
-                st.info("Enter an item code on the left to load item details and receive stock into your account.")
+                st.info("Select a location and item on the left to receive stock into this account.")
 
         if item_code:
 
@@ -4533,6 +5800,18 @@ else:
                 )
                 user_inventory_row = c.fetchone()
                 user_quantity = int(user_inventory_row[0]) if user_inventory_row else 0
+                c.execute(
+                    '''
+                    SELECT quantity FROM location_inventory
+                    WHERE location_id=? AND item_code=?
+                    ''',
+                    (selected_location_id, item_code)
+                )
+                location_inventory_row = c.fetchone()
+                location_quantity = int(location_inventory_row[0]) if location_inventory_row else 0
+                receiving_sales_stock = get_current_role() == "sales"
+                account_quantity = location_quantity if receiving_sales_stock else user_quantity
+                account_label = "Location Qty" if receiving_sales_stock else "My Current Qty"
 
                 with detail_col:
                     st.markdown(
@@ -4551,13 +5830,13 @@ else:
                     )
 
                     transfer_qty = st.number_input(
-                        "Quantity to Add to My Stock",
+                        "Quantity to Receive",
                         min_value=1,
                         step=1,
                         key="scan_transfer_quantity"
                     )
 
-                    user_after_preview = user_quantity + int(transfer_qty)
+                    account_after_preview = account_quantity + int(transfer_qty)
                     system_after_preview = max(int(item[4]) - int(transfer_qty), 0)
 
                     st.markdown(
@@ -4566,16 +5845,16 @@ else:
                             <div class="workflow-kicker">Stock Preview</div>
                             <div class="action-summary-grid">
                                 <div class="action-summary-card">
-                                    <div class="action-summary-label">My Current Qty</div>
-                                    <div class="action-summary-value">{user_quantity}</div>
+                                    <div class="action-summary-label">{account_label}</div>
+                                    <div class="action-summary-value">{account_quantity}</div>
                                 </div>
                                 <div class="action-summary-card">
                                     <div class="action-summary-label">Adding</div>
                                     <div class="action-summary-value">{int(transfer_qty)}</div>
                                 </div>
                                 <div class="action-summary-card">
-                                    <div class="action-summary-label">My Qty After</div>
-                                    <div class="action-summary-value">{user_after_preview}</div>
+                                    <div class="action-summary-label">{account_label} After</div>
+                                    <div class="action-summary-value">{account_after_preview}</div>
                                 </div>
                                 <div class="action-summary-card">
                                     <div class="action-summary-label">System Qty After</div>
@@ -4608,12 +5887,25 @@ else:
                             )
                             current_user_inventory = transfer_c.fetchone()
 
-                            if not current_inventory:
+                            transfer_c.execute(
+                                '''
+                                SELECT quantity FROM location_inventory
+                                WHERE location_id=? AND item_code=?
+                                ''',
+                                (selected_location_id, item_code)
+                            )
+                            current_location_inventory = transfer_c.fetchone()
+
+                            if not selected_location_id:
+                                transfer_conn.rollback()
+                                st.error("Select a receiving location before adding stock.")
+                            elif not current_inventory:
                                 transfer_conn.rollback()
                                 st.error("Item not found. Check the item code and try again.")
                             else:
                                 system_quantity_before = int(current_inventory[1])
                                 user_quantity_before = int(current_user_inventory[0]) if current_user_inventory else 0
+                                location_quantity_before = int(current_location_inventory[0]) if current_location_inventory else 0
                                 transfer_qty_int = int(transfer_qty)
 
                                 if transfer_qty_int > system_quantity_before:
@@ -4621,7 +5913,11 @@ else:
                                     st.error("Not enough system stock is available to allocate that quantity.")
                                 else:
                                     system_quantity_after = system_quantity_before - transfer_qty_int
-                                    user_quantity_after = user_quantity_before + transfer_qty_int
+                                    receiving_sales_stock = get_current_role() == "sales"
+                                    account_quantity_before = (
+                                        location_quantity_before if receiving_sales_stock else user_quantity_before
+                                    )
+                                    account_quantity_after = account_quantity_before + transfer_qty_int
 
                                     transfer_c.execute(
                                         '''
@@ -4632,36 +5928,49 @@ else:
                                         (system_quantity_after, int(current_inventory[0]))
                                     )
 
-                                    transfer_c.execute(
-                                        '''
-                                        INSERT INTO user_inventory (username,item_code,quantity)
-                                        VALUES (?,?,?)
-                                        ON CONFLICT(username,item_code)
-                                        DO UPDATE SET quantity=excluded.quantity
-                                        ''',
-                                        (st.session_state.username, item_code, user_quantity_after)
-                                    )
+                                    if receiving_sales_stock:
+                                        transfer_c.execute(
+                                            '''
+                                            INSERT INTO location_inventory (location_id,item_code,quantity)
+                                            VALUES (?,?,?)
+                                            ON CONFLICT(location_id,item_code)
+                                            DO UPDATE SET quantity=excluded.quantity
+                                            ''',
+                                            (selected_location_id, item_code, account_quantity_after)
+                                        )
+                                    else:
+                                        transfer_c.execute(
+                                            '''
+                                            INSERT INTO user_inventory (username,item_code,quantity)
+                                            VALUES (?,?,?)
+                                            ON CONFLICT(username,item_code)
+                                            DO UPDATE SET quantity=excluded.quantity
+                                            ''',
+                                            (st.session_state.username, item_code, account_quantity_after)
+                                        )
 
                                     transfer_c.execute(
                                         '''
                                         INSERT INTO transactions
-                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
-                                        VALUES (?,?,?,?,?,?,?)
+                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                        VALUES (?,?,?,?,?,?,?,?,?)
                                         ''',
                                         (
                                             st.session_state.username,
                                             item_code,
                                             transfer_qty_int,
-                                            user_quantity_before,
-                                            user_quantity_after,
+                                            account_quantity_before,
+                                            account_quantity_after,
                                             "allocation",
+                                            "location_stock" if receiving_sales_stock else "user_stock",
+                                            selected_location_id,
                                             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         )
                                     )
 
                                     transfer_conn.commit()
                                     st.session_state.scan_inventory_message = (
-                                        f"{transfer_qty_int} unit(s) added to your personal stock. Your quantity is now {user_quantity_after}; system stock is now {system_quantity_after}."
+                                        f"{transfer_qty_int} unit(s) received. Account quantity is now {account_quantity_after}; system stock is now {system_quantity_after}."
                                     )
                                     st.rerun()
 
@@ -4672,6 +5981,156 @@ else:
                         st.session_state.prefill_sell_item_code = item_code
                         st.session_state.menu = "Sell Item"
                         st.rerun()
+
+                    if get_current_role() == "user":
+                        st.markdown('<div class="dashboard-section-title">User Account Actions</div>', unsafe_allow_html=True)
+
+                        if user_quantity <= 0:
+                            st.info("No user-account stock is available to return or take out for this item.")
+                        else:
+                            action_col1, action_col2 = st.columns(2)
+                            with action_col1:
+                                return_qty = st.number_input(
+                                    "Return Leftover Quantity",
+                                    min_value=1,
+                                    max_value=max(user_quantity, 1),
+                                    step=1,
+                                    key="return_leftover_quantity"
+                                )
+                                if st.button("Return to Inventory", type="secondary", width="stretch"):
+                                    return_conn = get_connection()
+                                    return_c = return_conn.cursor()
+
+                                    try:
+                                        return_c.execute("BEGIN IMMEDIATE")
+                                        return_c.execute(
+                                            "SELECT id, quantity FROM inventory WHERE item_code=?",
+                                            (item_code,)
+                                        )
+                                        current_inventory = return_c.fetchone()
+                                        return_c.execute(
+                                            '''
+                                            SELECT quantity FROM user_inventory
+                                            WHERE username=? AND item_code=?
+                                            ''',
+                                            (st.session_state.username, item_code)
+                                        )
+                                        current_user_inventory = return_c.fetchone()
+
+                                        user_quantity_before = int(current_user_inventory[0]) if current_user_inventory else 0
+                                        return_qty_int = int(return_qty)
+
+                                        if not current_inventory:
+                                            return_conn.rollback()
+                                            st.error("Item not found. Check the item code and try again.")
+                                        elif return_qty_int > user_quantity_before:
+                                            return_conn.rollback()
+                                            st.error("You do not have enough stock to return that quantity.")
+                                        else:
+                                            user_quantity_after = user_quantity_before - return_qty_int
+                                            system_quantity_after = int(current_inventory[1]) + return_qty_int
+                                            return_c.execute(
+                                                "UPDATE inventory SET quantity=? WHERE id=?",
+                                                (system_quantity_after, int(current_inventory[0]))
+                                            )
+                                            return_c.execute(
+                                                '''
+                                                UPDATE user_inventory
+                                                SET quantity=?
+                                                WHERE username=? AND item_code=?
+                                                ''',
+                                                (user_quantity_after, st.session_state.username, item_code)
+                                            )
+                                            return_c.execute(
+                                                '''
+                                                INSERT INTO transactions
+                                                (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                                VALUES (?,?,?,?,?,?,?,?,?)
+                                                ''',
+                                                (
+                                                    st.session_state.username,
+                                                    item_code,
+                                                    return_qty_int,
+                                                    user_quantity_before,
+                                                    user_quantity_after,
+                                                    "return",
+                                                    "user_stock",
+                                                    selected_location_id,
+                                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                                )
+                                            )
+                                            return_conn.commit()
+                                            st.session_state.scan_inventory_message = (
+                                                f"{return_qty_int} unit(s) returned to inventory. Your quantity is now {user_quantity_after}."
+                                            )
+                                            st.rerun()
+                                    finally:
+                                        return_conn.close()
+
+                            with action_col2:
+                                take_out_qty = st.number_input(
+                                    "Take Out Quantity",
+                                    min_value=1,
+                                    max_value=max(user_quantity, 1),
+                                    step=1,
+                                    key="take_out_quantity"
+                                )
+                                if st.button("Take Out", type="secondary", width="stretch"):
+                                    take_out_conn = get_connection()
+                                    take_out_c = take_out_conn.cursor()
+
+                                    try:
+                                        take_out_c.execute("BEGIN IMMEDIATE")
+                                        take_out_c.execute(
+                                            '''
+                                            SELECT quantity FROM user_inventory
+                                            WHERE username=? AND item_code=?
+                                            ''',
+                                            (st.session_state.username, item_code)
+                                        )
+                                        current_user_inventory = take_out_c.fetchone()
+
+                                        user_quantity_before = int(current_user_inventory[0]) if current_user_inventory else 0
+                                        take_out_qty_int = int(take_out_qty)
+
+                                        if take_out_qty_int > user_quantity_before:
+                                            take_out_conn.rollback()
+                                            st.error("You do not have enough stock to take out that quantity.")
+                                        else:
+                                            user_quantity_after = user_quantity_before - take_out_qty_int
+                                            take_out_c.execute(
+                                                '''
+                                                UPDATE user_inventory
+                                                SET quantity=?
+                                                WHERE username=? AND item_code=?
+                                                ''',
+                                                (user_quantity_after, st.session_state.username, item_code)
+                                            )
+                                            take_out_c.execute(
+                                                '''
+                                                INSERT INTO transactions
+                                                (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                                VALUES (?,?,?,?,?,?,?,?,?)
+                                                ''',
+                                                (
+                                                    st.session_state.username,
+                                                    item_code,
+                                                    take_out_qty_int,
+                                                    user_quantity_before,
+                                                    user_quantity_after,
+                                                    "take_out",
+                                                    "user_stock",
+                                                    selected_location_id,
+                                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                                )
+                                            )
+                                            take_out_conn.commit()
+                                            st.session_state.scan_inventory_message = (
+                                                f"{take_out_qty_int} unit(s) taken out of your account. Your quantity is now {user_quantity_after}."
+                                            )
+                                            st.rerun()
+                                    finally:
+                                        take_out_conn.close()
 
             else:
                 with detail_col:
@@ -4708,6 +6167,8 @@ else:
 
         locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
         inventory_df = inventory_df[inventory_df["location_id"].isin(assigned_location_ids)].copy()
+        if supplied_item_codes:
+            inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
 
         st.markdown(
             """
@@ -4726,69 +6187,209 @@ else:
             st.markdown('<div class="dashboard-section-title">Create Sale Invoice</div>', unsafe_allow_html=True)
 
             if locations_df.empty:
-                st.info("You do not have any active assigned locations yet. Ruth must assign you to a location before you can sell.")
+                show_next_step(
+                    "You do not have any active assigned locations yet.",
+                    "Ruth should open Locations and assign your sales account to a location."
+                )
             elif inventory_df.empty:
-                st.info("No sellable inventory exists for your assigned locations. Ask an admin or Ruth to add location stock.")
+                show_next_step(
+                    "No sellable inventory exists for your assigned locations.",
+                    "Ask Ruth or an admin to add stock and pricing in Location Inventory."
+                )
             else:
                 location_options = {
                     f"{row['name']} (ID {row['id']})": int(row["id"])
                     for _, row in locations_df.iterrows()
                 }
                 create_sale_invoice = False
-                can_create_sale_invoice = False
 
-                with st.form("sales_create_invoice_form"):
-                    selected_location = st.selectbox("Location", list(location_options.keys()))
-                    selected_location_id = location_options[selected_location]
-                    available_items_df = inventory_df[inventory_df["location_id"] == selected_location_id].copy()
+                st.markdown(
+                    """
+                    <div class="workflow-panel">
+                        <div class="workflow-kicker">Step 1</div>
+                        <div class="workflow-title">Select Location</div>
+                        <div class="workflow-text">Choose the assigned location where this sale is happening.</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                selected_location = st.selectbox(
+                    "Location",
+                    list(location_options.keys()),
+                    key="sales_location_selector"
+                )
+                selected_location_id = location_options[selected_location]
+                available_items_df = inventory_df[inventory_df["location_id"] == selected_location_id].copy()
 
-                    item_options = {
-                        f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available - ${float(row['price']):.2f}":
-                        row["item_code"]
-                        for _, row in available_items_df.iterrows()
-                    }
+                item_options = {
+                    f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available - ${float(row['price']):.2f}":
+                    row["item_code"]
+                    for _, row in available_items_df.iterrows()
+                }
 
-                    if not item_options:
-                        st.info("This selected location has no available inventory to sell.")
-                        st.form_submit_button("Create Sale", disabled=True, width="stretch")
-                    else:
-                        can_create_sale_invoice = True
-                        customer_name = st.text_input("Customer / Company Name")
-                        selected_item = st.selectbox("Item", list(item_options.keys()))
-                        selected_item_code = item_options[selected_item]
-                        selected_item_row = available_items_df[
-                            available_items_df["item_code"] == selected_item_code
-                        ].iloc[0]
-                        available_quantity = int(selected_item_row["quantity"])
-                        default_price = float(selected_item_row["price"])
-                        sale_quantity = st.number_input(
-                            "Quantity",
-                            min_value=1,
-                            max_value=max(available_quantity, 1),
-                            step=1
+                if not item_options:
+                    st.info("This selected location has no available inventory to sell.")
+                    st.button("Create Sale", disabled=True, width="stretch")
+                else:
+                    st.markdown(
+                        """
+                        <div class="workflow-panel">
+                            <div class="workflow-kicker">Step 2</div>
+                            <div class="workflow-title">Select Item</div>
+                            <div class="workflow-text">Pick the item being sold. Available stock and price come from the selected location.</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    selected_item = st.selectbox(
+                        "Item",
+                        list(item_options.keys()),
+                        key=f"sales_item_selector_{selected_location_id}"
+                    )
+                    selected_item_code = item_options[selected_item]
+                    selected_item_row = available_items_df[
+                        available_items_df["item_code"] == selected_item_code
+                    ].iloc[0]
+                    available_quantity = int(selected_item_row["quantity"])
+                    default_price = float(selected_item_row["price"])
+
+                    with st.form(f"sales_create_invoice_form_{selected_location_id}_{selected_item_code}"):
+                        st.markdown(
+                            """
+                            <div class="workflow-kicker">Step 3</div>
+                            <div class="workflow-title">Confirm Sale and Payment</div>
+                            """,
+                            unsafe_allow_html=True
                         )
-                        unit_price = st.number_input(
-                            "Unit Price",
-                            min_value=0.0,
-                            value=default_price,
-                            step=0.01,
-                            format="%.2f"
+                        st.caption(
+                            f"Available at this location: {available_quantity} unit(s). "
+                            f"Default location price: ${default_price:.2f}."
                         )
-                        payment_amount = st.number_input(
-                            "Payment Amount",
-                            min_value=0.0,
-                            value=0.0,
-                            step=0.01,
-                            format="%.2f"
+                        st.markdown(
+                            '<div class="modern-form-note">Enter the sale details, then record the customer payment method before creating the invoice.</div>',
+                            unsafe_allow_html=True
                         )
-                        payment_method = st.selectbox("Payment Method", ["cash", "check", "wire", "credit_card"])
-                        reference_number = st.text_input("Payment Reference")
+                        customer_name = st.text_input(
+                            "Customer Name",
+                            placeholder="Customer or company name"
+                        )
+                        quantity_col, price_col = st.columns(2)
+                        with quantity_col:
+                            sale_quantity = st.number_input(
+                                "Quantity",
+                                min_value=1,
+                                max_value=max(available_quantity, 1),
+                                step=1
+                            )
+                        with price_col:
+                            unit_price = st.number_input(
+                                "Unit Price",
+                                min_value=0.0,
+                                value=default_price,
+                                step=0.01,
+                                format="%.2f"
+                            )
+
+                        sale_total_preview = int(sale_quantity) * float(unit_price)
+                        credit_col, payment_status_col = st.columns([0.9, 1.1])
+                        with credit_col:
+                            credit_status = st.selectbox(
+                                "Credit Sale",
+                                ["No", "Yes", "Partially Paid"],
+                                key=f"sales_credit_status_{selected_location_id}_{selected_item_code}"
+                            )
+                        with payment_status_col:
+                            payment_status_label = {
+                                "No": "Fully paid sale",
+                                "Yes": "Credit sale - unpaid",
+                                "Partially Paid": "Partial payment received",
+                            }[credit_status]
+                            st.text_input(
+                                "Payment Status",
+                                value=payment_status_label,
+                                disabled=True,
+                                key=f"sales_payment_status_{selected_location_id}_{selected_item_code}"
+                            )
+
+                        payment_amount = sale_total_preview if credit_status == "No" else 0.0
+                        payment_method = "cash"
+                        reference_number = ""
+
+                        if credit_status in {"No", "Partially Paid"}:
+                            payment_amount_col, payment_method_col = st.columns([1, 1])
+                            with payment_amount_col:
+                                payment_amount = st.number_input(
+                                    "Payment Amount",
+                                    min_value=0.0,
+                                    max_value=sale_total_preview,
+                                    value=sale_total_preview if credit_status == "No" else 0.0,
+                                    step=0.01,
+                                    format="%.2f",
+                                    disabled=credit_status == "No",
+                                    help="Full payment is automatic for No; enter the received amount for partially paid credit sales."
+                                )
+                            with payment_method_col:
+                                payment_method = st.selectbox(
+                                    "Payment Method",
+                                    ["cash", "check", "wire", "credit_card"]
+                                )
+                            reference_number = st.text_input(
+                                "Payment Reference",
+                                placeholder="Check number, wire ID, card note, or receipt number"
+                            )
+                        else:
+                            st.caption("No payment details are required for unpaid credit sales.")
+
+                        if credit_status == "Partially Paid" and payment_amount <= 0:
+                            st.warning("Enter the partial payment amount before creating the sale.")
+                        paid_preview = float(payment_amount)
+                        balance_preview = max(sale_total_preview - paid_preview, 0)
+                        sale_stock_after = max(available_quantity - int(sale_quantity), 0)
+                        st.markdown(
+                            f"""
+                            <div class="modern-form-summary">
+                                <div class="modern-form-summary-title">Sale Preview</div>
+                                <div class="modern-form-summary-grid four">
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Sale Total</div>
+                                        <div class="modern-form-summary-value">${sale_total_preview:,.2f}</div>
+                                    </div>
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Payment</div>
+                                        <div class="modern-form-summary-value">${paid_preview:,.2f}</div>
+                                    </div>
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Balance</div>
+                                        <div class="modern-form-summary-value">${balance_preview:,.2f}</div>
+                                    </div>
+                                    <div class="modern-form-summary-card">
+                                        <div class="modern-form-summary-label">Stock After</div>
+                                        <div class="modern-form-summary-value">{sale_stock_after} units</div>
+                                    </div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
                         create_sale_invoice = st.form_submit_button("Create Sale", type="primary", width="stretch")
 
-                if create_sale_invoice and can_create_sale_invoice:
+                if create_sale_invoice:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     quantity_int = int(sale_quantity)
                     line_total = quantity_int * float(unit_price)
+                    if float(payment_amount) > line_total:
+                        st.error(f"Payment cannot exceed the sale total of ${line_total:,.2f}.")
+                        st.stop()
+                    if credit_status == "No" and float(payment_amount) != line_total:
+                        st.error("Credit Sale 'No' means the sale must be fully paid.")
+                        st.stop()
+                    if credit_status == "Yes" and float(payment_amount) != 0:
+                        st.error("Credit Sale 'Yes' means no payment has been received yet.")
+                        st.stop()
+                    if credit_status == "Partially Paid" and not (0 < float(payment_amount) < line_total):
+                        st.error("Credit Sale 'Partially Paid' requires a payment greater than 0 and less than the sale total.")
+                        st.stop()
+
                     conn = get_connection()
                     c = conn.cursor()
 
@@ -4864,20 +6465,22 @@ else:
 
                             c.execute(
                                 '''
-                                INSERT INTO transactions
-                                (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
-                                VALUES (?,?,?,?,?,?,?)
-                                ''',
-                                (
-                                    st.session_state.username,
-                                    selected_item_code,
-                                    quantity_int,
-                                    current_quantity,
-                                    current_quantity - quantity_int,
-                                    "sale",
-                                    now
+                                    INSERT INTO transactions
+                                    (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                    VALUES (?,?,?,?,?,?,?,?,?)
+                                    ''',
+                                    (
+                                        st.session_state.username,
+                                        selected_item_code,
+                                        quantity_int,
+                                        current_quantity,
+                                        current_quantity - quantity_int,
+                                        "sale",
+                                        "location_stock",
+                                        selected_location_id,
+                                        now
+                                    )
                                 )
-                            )
                             conn.commit()
                             st.session_state.sales_invoice_message = (
                                 f"Sale invoice {invoice_number} created successfully. Assigned location inventory was reduced and payment details were saved if provided."
@@ -5093,8 +6696,8 @@ else:
                                     sale_c.execute(
                                         '''
                                         INSERT INTO transactions
-                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,transaction_time)
-                                        VALUES (?,?,?,?,?,?,?)
+                                        (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
+                                        VALUES (?,?,?,?,?,?,?,?,?)
                                         ''',
                                         (
                                             st.session_state.username,
@@ -5103,6 +6706,8 @@ else:
                                             quantity_before,
                                             quantity_after,
                                             "sale",
+                                            "user_stock",
+                                            None,
                                             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         )
                                     )
@@ -5129,25 +6734,12 @@ else:
             conn
         )
 
-        invoice_logs_df = pd.read_sql_query(
-            '''
-            SELECT inv.id, inv.location_id, inv.created_by AS username, ii.item_code,
-                   'sale' AS transaction_type, 0 AS quantity_before,
-                   ii.quantity AS quantity_used, 0 AS quantity_after,
-                   inv.created_at AS transaction_time
-            FROM invoices inv
-            LEFT JOIN invoice_items ii ON ii.invoice_id = inv.id
-            ORDER BY inv.id DESC
-            ''',
-            conn
-        )
-
         conn.close()
 
         if has_admin_access() and not is_super_admin():
             assigned_location_ids = get_assigned_location_ids()
             supplied_item_codes = set(get_supplied_item_codes())
-            df = invoice_logs_df[invoice_logs_df["location_id"].isin(assigned_location_ids)].copy()
+            df = df[df["location_id"].isin(assigned_location_ids)].copy()
 
             if supplied_item_codes:
                 df = df[df["item_code"].isin(supplied_item_codes)].copy()
@@ -5169,14 +6761,18 @@ else:
 
         if not df.empty:
             df["transaction_type"] = df["transaction_type"].fillna("legacy")
+            df["source_type"] = df["source_type"].fillna("legacy")
             df["quantity_before"] = df["quantity_before"].fillna(0).astype(int)
+            df["quantity_used"] = df["quantity_used"].fillna(0).astype(int)
             df["quantity_after"] = df["quantity_after"].fillna(0).astype(int)
+            df["verification"] = df.apply(transaction_verification_status, axis=1)
 
         total_logs = len(df)
         total_allocated = int(df.loc[df["transaction_type"] == "allocation", "quantity_used"].sum()) if not df.empty else 0
         total_sold = int(df.loc[df["transaction_type"] == "sale", "quantity_used"].sum()) if not df.empty else 0
         unique_items_used = df["item_code"].nunique() if not df.empty else 0
         active_users = df["username"].nunique() if not df.empty else 0
+        verified_logs = int((df["verification"] == "Verified").sum()) if not df.empty else 0
 
         log_col1, log_col2, log_col3, log_col4 = st.columns(4)
 
@@ -5195,11 +6791,11 @@ else:
         with log_col2:
             st.markdown(
                 f"""
-                <div class="dashboard-card">
-                    <div class="dashboard-card-label">Quantity Sold</div>
-                    <div class="dashboard-card-value">{total_sold}</div>
-                    <div class="dashboard-card-note">Units sold from user stock</div>
-                </div>
+                    <div class="dashboard-card">
+                        <div class="dashboard-card-label">Quantity Sold</div>
+                        <div class="dashboard-card-value">{total_sold}</div>
+                        <div class="dashboard-card-note">Units sold from location or user stock</div>
+                    </div>
                 """,
                 unsafe_allow_html=True
             )
@@ -5219,11 +6815,11 @@ else:
         with log_col4:
             st.markdown(
                 f"""
-                <div class="dashboard-card">
-                    <div class="dashboard-card-label">Users</div>
-                    <div class="dashboard-card-value">{active_users}</div>
-                    <div class="dashboard-card-note">People recording usage</div>
-                </div>
+                    <div class="dashboard-card">
+                        <div class="dashboard-card-label">Verified</div>
+                        <div class="dashboard-card-value">{verified_logs}</div>
+                        <div class="dashboard-card-note">Rows with matching deduction math</div>
+                    </div>
                 """,
                 unsafe_allow_html=True
             )
@@ -5252,9 +6848,17 @@ else:
                 ]
 
             display_df = display_df.copy()
+            display_df["verification"] = display_df.get("verification", "Unverified")
+            display_df["source_type"] = display_df["source_type"].replace({
+                "location_stock": "Sales Account",
+                "user_stock": "User Account",
+                "legacy": "Legacy",
+            })
             display_df["transaction_type"] = display_df["transaction_type"].replace({
                 "allocation": "Added to My Stock",
                 "sale": "Sold Item",
+                "return": "Returned to Inventory",
+                "take_out": "Taken Out",
                 "legacy": "Legacy Record",
             })
             display_df = display_df[
@@ -5263,9 +6867,11 @@ else:
                     "username",
                     "item_code",
                     "transaction_type",
+                    "source_type",
                     "quantity_before",
                     "quantity_used",
                     "quantity_after",
+                    "verification",
                     "transaction_time",
                 ]
             ]
@@ -5279,9 +6885,11 @@ else:
                     "username": "User",
                     "item_code": "Item Code",
                     "transaction_type": "Action",
-                    "quantity_before": "My Qty Before",
+                    "source_type": "Source",
+                    "quantity_before": "Qty Before",
                     "quantity_used": "Quantity Changed",
-                    "quantity_after": "My Qty After",
+                    "quantity_after": "Qty After",
+                    "verification": "Verification",
                     "transaction_time": "Transaction Time",
                 }
             )

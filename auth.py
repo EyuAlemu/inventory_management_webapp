@@ -84,14 +84,11 @@ def add_default_admin():
     c.execute("SELECT * FROM users WHERE username='admin'")
     if not c.fetchone():
         initial_admin_password = get_initial_admin_password()
-        if not initial_admin_password:
-            conn.close()
-            return
-
-        c.execute(
-            "INSERT INTO users (username,password,role) VALUES (?,?,?)",
-            ("admin", hash_password(initial_admin_password), "admin")
-        )
+        if initial_admin_password:
+            c.execute(
+                "INSERT INTO users (username,password,role) VALUES (?,?,?)",
+                ("admin", hash_password(initial_admin_password), "admin")
+            )
 
     initial_super_admin_password = get_initial_super_admin_password()
     c.execute("SELECT id, role FROM users WHERE lower(username)=lower(?)", (SUPER_ADMIN_USERNAME,))

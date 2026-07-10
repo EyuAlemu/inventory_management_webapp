@@ -27,7 +27,8 @@ def init_db():
         item_code TEXT UNIQUE,
         item_name TEXT,
         description TEXT,
-        quantity INTEGER
+        quantity INTEGER,
+        cost REAL DEFAULT 0
     )
     ''')
 
@@ -40,6 +41,8 @@ def init_db():
         quantity_before INTEGER,
         quantity_after INTEGER,
         transaction_type TEXT,
+        source_type TEXT,
+        location_id INTEGER,
         transaction_time TEXT
     )
     ''')
@@ -180,6 +183,18 @@ def init_db():
 
     if "transaction_type" not in transaction_columns:
         c.execute("ALTER TABLE transactions ADD COLUMN transaction_type TEXT")
+
+    if "source_type" not in transaction_columns:
+        c.execute("ALTER TABLE transactions ADD COLUMN source_type TEXT")
+
+    if "location_id" not in transaction_columns:
+        c.execute("ALTER TABLE transactions ADD COLUMN location_id INTEGER")
+
+    c.execute("PRAGMA table_info(inventory)")
+    inventory_columns = {column[1] for column in c.fetchall()}
+
+    if "cost" not in inventory_columns:
+        c.execute("ALTER TABLE inventory ADD COLUMN cost REAL DEFAULT 0")
 
     conn.commit()
     conn.close()

@@ -91,6 +91,39 @@ Standard users can:
 - Sell from personal assigned stock
 - View their own dashboard and transaction logs
 
+## Role Access Matrix
+
+`✓` means the role has access. `X` means the role does not have access. Some admin and sales access is limited to the locations or products Ruth assigns.
+
+| Functionality | Ruth | Admin | Sales | User |
+|---|---:|---:|---:|---:|
+| View dashboard / overview | ✓ | ✓ | ✓ | ✓ |
+| Create locations | ✓ | X | X | X |
+| Edit or deactivate locations | ✓ | X | X | X |
+| Create users | ✓ | X | X | X |
+| Delete users | ✓ | X | X | X |
+| Assign users to locations | ✓ | X | X | X |
+| Create inventory items | ✓ | X | X | X |
+| Edit or delete inventory items | ✓ | X | X | X |
+| Assign inventory products to users | ✓ | X | X | X |
+| Set stock and pricing by location | ✓ | ✓ | X | X |
+| View assigned location stock | ✓ | ✓ | ✓ | X |
+| Receive stock into a location | ✓ | ✓ | ✓ | X |
+| Receive stock into personal account | X | X | X | ✓ |
+| Sell from location stock | ✓ | ✓ | ✓ | X |
+| Sell from personal stock | X | X | X | ✓ |
+| Create invoices | ✓ | ✓ | ✓ | X |
+| Record payments | ✓ | ✓ | ✓ | X |
+| View financial reports | ✓ | ✓ | X | X |
+| View sales reports | ✓ | X | X | X |
+| Record returns or damaged items | ✓ | ✓ | ✓ | X |
+| Transfer stock between locations | ✓ | ✓ | X | X |
+| Return leftover personal stock | X | X | X | ✓ |
+| Take out personal stock | X | X | X | ✓ |
+| Scan QR or barcode | ✓ | X | X | ✓ |
+| Print QR labels | ✓ | X | X | X |
+| View transaction logs | ✓ | ✓ | ✓ | ✓ |
+
 ## First-Time Setup
 
 Install dependencies:
@@ -156,6 +189,14 @@ INITIAL_SUPER_ADMIN_PASSWORD = "your_ruth_password"
 8. Open **Financials** to view all invoices, payments, payment method summaries, and outstanding balances.
 9. Open **Returns** to review returned or damaged items across locations.
 10. Open **Dashboard**, **Manage Sales**, and **Transaction Logs** for company-wide operational reporting.
+
+For detailed step-by-step role guides, see:
+
+- [RUTH_USER_GUIDE.md](RUTH_USER_GUIDE.md)
+- [ADMIN_USER_GUIDE.md](ADMIN_USER_GUIDE.md)
+- [SALES_USER_GUIDE.md](SALES_USER_GUIDE.md)
+- [STANDARD_USER_GUIDE.md](STANDARD_USER_GUIDE.md)
+- [APP_TEST_MILESTONES.md](APP_TEST_MILESTONES.md)
 
 ## Admin Workflow
 
