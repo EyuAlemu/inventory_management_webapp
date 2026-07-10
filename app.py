@@ -2339,7 +2339,6 @@ else:
         username_safe = safe_html(st.session_state.username)
         assigned_location_ids = get_assigned_location_ids()
         supplied_item_codes = set(get_supplied_item_codes())
-        supplied_item_codes = set(get_supplied_item_codes())
 
         conn = get_connection()
         sales_locations_df = pd.read_sql_query(
@@ -6144,6 +6143,7 @@ else:
             del st.session_state.sales_invoice_message
 
         assigned_location_ids = get_assigned_location_ids()
+        supplied_item_codes = set(get_supplied_item_codes())
 
         conn = get_connection()
         locations_df = pd.read_sql_query(
