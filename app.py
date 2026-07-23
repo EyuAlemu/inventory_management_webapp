@@ -139,6 +139,42 @@ def delete_item_code_references(cursor, item_code):
         )
 
 
+def get_item_delete_blockers(cursor, item_code):
+    blocker_queries = [
+        ("assigned user stock", "SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_code=?", "stock unit(s)"),
+        ("location stock", "SELECT COALESCE(SUM(quantity), 0) FROM location_inventory WHERE item_code=?", "stock unit(s)"),
+        ("location pricing", "SELECT COUNT(*) FROM location_prices WHERE item_code=?", "pricing record(s)"),
+        ("supplier assignments", "SELECT COUNT(*) FROM product_suppliers WHERE item_code=?", "assignment(s)"),
+        ("transactions", "SELECT COUNT(*) FROM transactions WHERE item_code=?", "transaction(s)"),
+        ("invoice items", "SELECT COUNT(*) FROM invoice_items WHERE item_code=?", "invoice item(s)"),
+        ("returns", "SELECT COUNT(*) FROM returns WHERE item_code=?", "return record(s)"),
+        ("inventory transfers", "SELECT COUNT(*) FROM inventory_transfers WHERE item_code=?", "transfer record(s)"),
+    ]
+    blockers = []
+
+    for label, query, unit_label in blocker_queries:
+        cursor.execute(query, (item_code,))
+        related_count = int(cursor.fetchone()[0] or 0)
+        if related_count > 0:
+            blockers.append(f"{label}: {related_count} {unit_label}")
+
+    return blockers
+
+
+def sync_inventory_quantity(cursor, item_code, fallback_quantity=0):
+    cursor.execute(
+        "SELECT COALESCE(SUM(quantity), 0), COUNT(*) FROM location_inventory WHERE item_code=?",
+        (item_code,)
+    )
+    location_quantity, location_row_count = cursor.fetchone()
+    synced_quantity = int(location_quantity or 0) if int(location_row_count or 0) > 0 else int(fallback_quantity)
+    cursor.execute(
+        "UPDATE inventory SET quantity=? WHERE item_code=?",
+        (synced_quantity, item_code)
+    )
+    return synced_quantity
+
+
 def get_invoice_balance(cursor, invoice_id):
     cursor.execute(
         '''
@@ -805,6 +841,159 @@ else:
             font-size: 1.05rem;
             font-weight: 800;
             margin: 1.35rem 0 0.4rem;
+        }
+
+        :root,
+        .stApp,
+        [data-testid="stAppViewContainer"] {
+            --primary-color: #1d4ed8 !important;
+            --primary-color-hover: #2563eb !important;
+            --primary-color-active: #1e40af !important;
+        }
+
+        div[data-testid="stTabs"] [role="tablist"] {
+            gap: 0.8rem !important;
+            border-bottom: 0 !important;
+            margin: 0.65rem 0 1.1rem !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"] {
+            background: #eaf2ff !important;
+            border: 2px solid #8bb7f0 !important;
+            border-radius: 8px !important;
+            color: #0f3f86 !important;
+            font-size: 0.95rem !important;
+            font-weight: 850 !important;
+            min-height: 2.75rem !important;
+            padding: 0.62rem 1.15rem !important;
+            box-shadow: 0 8px 16px rgba(15, 63, 134, 0.11) !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"] p {
+            color: inherit !important;
+            font-size: 0.95rem !important;
+            font-weight: 850 !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"]:hover {
+            background: #dbeafe !important;
+            border-color: #2563eb !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            background: #1d4ed8 !important;
+            border-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            box-shadow: 0 10px 20px rgba(29, 78, 216, 0.24) !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p {
+            color: #ffffff !important;
+        }
+
+        div[data-testid="stSegmentedControl"] {
+            --primary-color: #1d4ed8 !important;
+        }
+
+        div[data-testid="stSegmentedControl"] [role="radiogroup"] {
+            gap: 0.45rem !important;
+        }
+
+        div[data-testid="stSegmentedControl"] button,
+        div[data-testid="stSegmentedControl"] label,
+        div[data-testid="stSegmentedControl"] [role="radio"] {
+            background: #eaf2ff !important;
+            border: 1.5px solid #8bb7f0 !important;
+            border-radius: 8px !important;
+            color: #0f3f86 !important;
+            font-size: 0.95rem !important;
+            font-weight: 850 !important;
+            min-height: 2.65rem !important;
+            padding: 0.55rem 1.05rem !important;
+            box-shadow: 0 6px 14px rgba(29, 78, 216, 0.1) !important;
+        }
+
+        div[data-testid="stSegmentedControl"] button:hover,
+        div[data-testid="stSegmentedControl"] label:hover,
+        div[data-testid="stSegmentedControl"] [role="radio"]:hover {
+            background: #dbeafe !important;
+            border-color: #2563eb !important;
+            color: #0f3f86 !important;
+        }
+
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"],
+        div[data-testid="stSegmentedControl"] button[aria-checked="true"],
+        div[data-testid="stSegmentedControl"] label[aria-checked="true"],
+        div[data-testid="stSegmentedControl"] label[data-checked="true"],
+        div[data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"],
+        div[data-testid="stSegmentedControl"] [data-selected="true"],
+        div[data-testid="stSegmentedControl"] label:has(input:checked) {
+            background: #1d4ed8 !important;
+            border-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            box-shadow: 0 9px 18px rgba(29, 78, 216, 0.22) !important;
+        }
+
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"] *,
+        div[data-testid="stSegmentedControl"] button[aria-checked="true"] *,
+        div[data-testid="stSegmentedControl"] label[aria-checked="true"] *,
+        div[data-testid="stSegmentedControl"] label[data-checked="true"] *,
+        div[data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] *,
+        div[data-testid="stSegmentedControl"] [data-selected="true"] *,
+        div[data-testid="stSegmentedControl"] label:has(input:checked) * {
+            color: #ffffff !important;
+        }
+
+        .st-key-inventory_section_buttons div.stButton > button,
+        .st-key-locations_section_buttons div.stButton > button {
+            border-radius: 8px !important;
+            min-height: 2.75rem !important;
+            font-size: 0.95rem !important;
+            font-weight: 850 !important;
+            border: 1.5px solid #93c5fd !important;
+            box-shadow: 0 8px 18px rgba(30, 64, 175, 0.1) !important;
+        }
+
+        .st-key-inventory_section_buttons div.stButton > button[kind="secondary"],
+        .st-key-locations_section_buttons div.stButton > button[kind="secondary"] {
+            background: #eff6ff !important;
+            color: #1e3a8a !important;
+        }
+
+        .st-key-inventory_section_buttons div.stButton > button[kind="secondary"]:hover,
+        .st-key-locations_section_buttons div.stButton > button[kind="secondary"]:hover {
+            background: #dbeafe !important;
+            border-color: #2563eb !important;
+            color: #1d4ed8 !important;
+            transform: translateY(-1px);
+        }
+
+        .st-key-inventory_section_buttons div.stButton > button[kind="primary"],
+        .st-key-locations_section_buttons div.stButton > button[kind="primary"] {
+            background: #1e40af !important;
+            border-color: #1e40af !important;
+            color: #ffffff !important;
+            box-shadow: 0 12px 24px rgba(30, 64, 175, 0.25) !important;
+        }
+
+        .st-key-inventory_back_to_table div.stButton > button,
+        .st-key-location_back_to_table div.stButton > button {
+            background: #eff6ff !important;
+            border: 1.5px solid #2563eb !important;
+            border-radius: 8px !important;
+            color: #1d4ed8 !important;
+            font-size: 0.95rem !important;
+            font-weight: 850 !important;
+            min-height: 2.65rem !important;
+            box-shadow: 0 8px 18px rgba(37, 99, 235, 0.13) !important;
+        }
+
+        .st-key-inventory_back_to_table div.stButton > button:hover,
+        .st-key-location_back_to_table div.stButton > button:hover {
+            background: #1d4ed8 !important;
+            border-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            transform: translateY(-1px);
         }
 
         .content-panel {
@@ -3110,6 +3299,12 @@ else:
     if has_admin_access():
 
         if menu == "Add Inventory":
+            conn = get_connection()
+            existing_locations_df = pd.read_sql_query(
+                "SELECT id, name, address FROM locations WHERE active=1 ORDER BY name",
+                conn
+            )
+            conn.close()
 
             st.markdown(
                 """
@@ -3128,12 +3323,46 @@ else:
                 st.markdown('<div class="dashboard-section-title">Inventory Entry</div>', unsafe_allow_html=True)
                 st.markdown('<div class="add-inventory-form">', unsafe_allow_html=True)
 
+                selected_existing_location_id = None
+                location_name = ""
+                location_address = ""
+
+                if existing_locations_df.empty:
+                    st.info("Create an active location from the Locations page before adding inventory.")
+                else:
+                    location_options = [
+                        f"{row['name']} (ID {int(row['id'])})"
+                        for _, row in existing_locations_df.iterrows()
+                    ]
+                    selected_location_option = st.selectbox(
+                        "Select Location Name",
+                        location_options,
+                        help="Select an existing location for this inventory entry.",
+                        key="inventory_entry_location_selector"
+                    )
+                    selected_existing_location_id = int(
+                        selected_location_option.rsplit("ID ", 1)[1].rstrip(")")
+                    )
+                    selected_location_row = existing_locations_df[
+                        existing_locations_df["id"] == selected_existing_location_id
+                    ].iloc[0]
+                    location_name = str(selected_location_row["name"])
+                    location_address = (
+                        str(selected_location_row["address"])
+                        if pd.notna(selected_location_row["address"])
+                        else ""
+                    )
+                    st.text_area(
+                        "Address / Notes",
+                        value=location_address,
+                        disabled=True,
+                        key=f"inventory_location_address_{selected_existing_location_id}"
+                    )
+
                 with st.form("add_inventory_form"):
                     item_code = st.text_input("Item Code", key="admin_item_code")
                     item_name = st.text_input("Item Name")
                     description = st.text_area("Description")
-                    location_name = st.text_input("Location Name")
-                    location_address = st.text_area("Location Address")
                     quantity = st.number_input(
                         "Quantity",
                         min_value=1,
@@ -3149,7 +3378,8 @@ else:
                     save_inventory = st.form_submit_button(
                         "Save Inventory Entry",
                         type="primary",
-                        width="stretch"
+                        width="stretch",
+                        disabled=existing_locations_df.empty
                     )
 
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -3196,14 +3426,13 @@ else:
 
             if save_inventory:
 
-                if not item_code.strip() or not item_name.strip() or not location_name.strip():
-                    st.error("Item code, item name, and location name are required before an inventory entry can be saved.")
+                if not item_code.strip() or not item_name.strip() or selected_existing_location_id is None:
+                    st.error("Item code, item name, and location are required before an inventory entry can be saved.")
                 else:
                     conn = get_connection()
                     c = conn.cursor()
 
                     try:
-                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         c.execute("BEGIN IMMEDIATE")
                         c.execute(
                             '''
@@ -3219,28 +3448,8 @@ else:
                                 float(inventory_cost)
                             )
                         )
-                        c.execute(
-                            '''
-                            INSERT INTO locations (name,address,owner_username,active,created_at)
-                            VALUES (?,?,?,?,?)
-                            ON CONFLICT(name)
-                            DO UPDATE SET
-                                address=excluded.address,
-                                active=1
-                            ''',
-                            (
-                                location_name.strip(),
-                                location_address.strip(),
-                                st.session_state.username,
-                                1,
-                                now
-                            )
-                        )
-                        c.execute(
-                            "SELECT id FROM locations WHERE name=?",
-                            (location_name.strip(),)
-                        )
-                        location_id = c.fetchone()[0]
+                        location_id = selected_existing_location_id
+
                         c.execute(
                             '''
                             INSERT INTO location_inventory (location_id,item_code,quantity)
@@ -3249,15 +3458,6 @@ else:
                             DO UPDATE SET quantity=excluded.quantity
                             ''',
                             (location_id, item_code.strip(), int(quantity))
-                        )
-                        c.execute(
-                            '''
-                            INSERT INTO location_prices (location_id,item_code,price)
-                            VALUES (?,?,?)
-                            ON CONFLICT(location_id,item_code)
-                            DO UPDATE SET price=excluded.price
-                            ''',
-                            (location_id, item_code.strip(), float(inventory_cost))
                         )
 
                         conn.commit()
@@ -3279,7 +3479,11 @@ else:
 
             df = pd.read_sql_query(
                 '''
-                SELECT i.id, i.item_code, i.item_name, i.description, i.quantity, i.cost,
+                SELECT i.id, i.item_code, i.item_name, i.description,
+                       i.quantity AS inventory_quantity,
+                       COALESCE(li.quantity, i.quantity, 0) AS quantity,
+                       i.cost,
+                       li.location_id,
                        COALESCE(l.name, '') AS location_name,
                        COALESCE(l.address, '') AS location_address
                 FROM inventory i
@@ -3287,6 +3491,10 @@ else:
                 LEFT JOIN locations l ON l.id = li.location_id
                 ORDER BY i.item_name, l.name
                 ''',
+                conn
+            )
+            inventory_locations_df = pd.read_sql_query(
+                "SELECT id, name, address, active FROM locations ORDER BY active DESC, name",
                 conn
             )
 
@@ -3303,10 +3511,19 @@ else:
                 unsafe_allow_html=True
             )
 
+            if not df.empty:
+                df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
+                df["inventory_quantity"] = pd.to_numeric(df["inventory_quantity"], errors="coerce").fillna(0).astype(int)
+                df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(0.0)
+                df["total_cost"] = df["quantity"] * df["cost"]
+                df["location_total_cost"] = df.groupby(
+                    df["location_id"].fillna("unassigned")
+                )["total_cost"].transform("sum")
+
             unique_inventory_df = df.drop_duplicates(subset=["id"]) if not df.empty else df
             total_items = len(unique_inventory_df)
-            total_quantity = int(unique_inventory_df["quantity"].sum()) if not unique_inventory_df.empty else 0
-            low_stock = int((unique_inventory_df["quantity"] <= 5).sum()) if not unique_inventory_df.empty else 0
+            total_quantity = int(unique_inventory_df["inventory_quantity"].sum()) if not unique_inventory_df.empty else 0
+            low_stock = int((unique_inventory_df["inventory_quantity"] <= 5).sum()) if not unique_inventory_df.empty else 0
 
             inv_col1, inv_col2, inv_col3 = st.columns(3)
 
@@ -3381,115 +3598,375 @@ else:
                     st.success(st.session_state.inventory_message)
                     del st.session_state.inventory_message
 
-                st.markdown('<div class="inventory-action-buttons">', unsafe_allow_html=True)
+                inventory_section = None
 
-                header_cols = st.columns([0.9, 1.2, 1.5, 1.1, 1.4, 0.6, 0.8, 0.8], gap=None)
-                for col, label in zip(
-                    header_cols,
-                    ["Item Code", "Item Name", "Description", "Location", "Address", "Qty", "Cost", "Action"]
-                ):
-                    with col:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell header">{label}</div>',
-                            unsafe_allow_html=True
+                if display_df.empty:
+                    st.info("No inventory items match the current search.")
+                else:
+                    table_df = display_df.copy()
+                    table_df["Location"] = table_df["location_name"].replace("", "Unassigned")
+                    table_df["Address"] = table_df["location_address"].replace("", "No address")
+                    table_df["Item Code"] = table_df["item_code"]
+                    table_df["Item Name"] = table_df["item_name"]
+                    table_df["Description"] = table_df["description"]
+                    table_df["Quantity"] = table_df["quantity"]
+                    table_df["Single Cost"] = table_df["cost"]
+                    table_df["Total Cost"] = table_df["total_cost"]
+                    table_df["Location Total Cost"] = table_df["location_total_cost"]
+                    table_df["Edit Label"] = table_df.apply(
+                        lambda item_row: (
+                            f"{item_row['item_code']} - {item_row['item_name']} "
+                            f"({item_row['Location']})"
+                        ),
+                        axis=1
+                    )
+
+                    location_summary_df = (
+                        table_df.groupby(["Location", "Address"], as_index=False)
+                        .agg(
+                            Items=("Item Code", "count"),
+                            Quantity=("Quantity", "sum"),
+                            **{"Location Total Cost": ("Total Cost", "sum")}
+                        )
+                        .sort_values("Location")
+                    )
+
+                    visible_columns = [
+                        "Location",
+                        "Address",
+                        "Item Code",
+                        "Item Name",
+                        "Description",
+                        "Quantity",
+                        "Single Cost",
+                        "Total Cost",
+                        "Location Total Cost"
+                    ]
+                    location_item_columns = [
+                        "Item Code",
+                        "Item Name",
+                        "Description",
+                        "Quantity",
+                        "Single Cost",
+                        "Total Cost"
+                    ]
+                    column_config = {
+                        "Quantity": st.column_config.NumberColumn("Quantity"),
+                        "Single Cost": st.column_config.NumberColumn("Single Cost", format="$%.2f"),
+                        "Total Cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
+                        "Location Total Cost": st.column_config.NumberColumn(
+                            "Location Total Cost",
+                            format="$%.2f"
+                        ),
+                    }
+
+                    def select_inventory_row(selected_edit_row):
+                        st.session_state.manage_inventory_id = int(selected_edit_row["id"])
+                        st.session_state.manage_inventory_location_id = (
+                            int(selected_edit_row["location_id"])
+                            if "location_id" in selected_edit_row and pd.notna(selected_edit_row["location_id"])
+                            else None
+                        )
+                        st.session_state.inventory_view_section = "Edit Inventory"
+                        st.rerun()
+
+                    if "inventory_view_section" not in st.session_state:
+                        st.session_state.inventory_view_section = "View Inventory"
+
+                    if st.session_state.get("manage_inventory_id"):
+                        st.session_state.inventory_view_section = "Edit Inventory"
+
+                    with st.container(key="inventory_section_buttons"):
+                        section_cols = st.columns(3, gap="medium")
+                        for section_col, section_label in zip(
+                            section_cols,
+                            ["View Inventory", "Edit Inventory", "Cost Summary by Location"]
+                        ):
+                            with section_col:
+                                if st.button(
+                                    section_label,
+                                    key=f"inventory_section_{section_label.replace(' ', '_').lower()}",
+                                    type=(
+                                        "primary"
+                                        if st.session_state.inventory_view_section == section_label
+                                        else "secondary"
+                                    ),
+                                    width="stretch"
+                                ):
+                                    if section_label != "Edit Inventory":
+                                        st.session_state.manage_inventory_id = None
+                                        st.session_state.manage_inventory_location_id = None
+                                    st.session_state.inventory_view_section = section_label
+                                    st.rerun()
+
+                    inventory_section = st.session_state.inventory_view_section
+                    selected_item = None
+
+                    if "manage_inventory_id" in st.session_state and st.session_state.manage_inventory_id:
+                        selected_rows = df[df["id"] == st.session_state.manage_inventory_id]
+                        selected_location_id = st.session_state.get("manage_inventory_location_id")
+                        if selected_location_id is not None and "location_id" in selected_rows:
+                            selected_rows = selected_rows[selected_rows["location_id"] == selected_location_id]
+                        if not selected_rows.empty:
+                            selected_item = selected_rows.iloc[0]
+
+                    if inventory_section == "View Inventory":
+                        table_view = st.radio(
+                            "Inventory table view",
+                            ["Separate by Location", "All Locations"],
+                            horizontal=True,
+                            label_visibility="collapsed",
+                            key="inventory_table_view_mode"
                         )
 
-                for row_index, row in display_df.iterrows():
-                    row_cols = st.columns([0.9, 1.2, 1.5, 1.1, 1.4, 0.6, 0.8, 0.8], gap=None)
-                    item_code_safe = safe_html(row["item_code"])
-                    item_name_safe = safe_html(row["item_name"])
-                    description_safe = safe_html(row["description"])
-                    location_name_safe = safe_html(row["location_name"] or "Unassigned")
-                    location_address_safe = safe_html(row["location_address"] or "No address")
-                    cost = float(row["cost"]) if "cost" in row and pd.notna(row["cost"]) else 0.0
+                        if table_view == "Separate by Location":
+                            for location_name, location_df in table_df.sort_values(
+                                ["Location", "Item Name", "Item Code"]
+                            ).groupby("Location", sort=True):
+                                location_total = float(location_df["Total Cost"].sum())
+                                location_address = str(location_df["Address"].iloc[0] or "No address")
+                                st.markdown(
+                                    f"""
+                                    <div class="dashboard-section-title">
+                                        {safe_html(location_name)} - ${location_total:,.2f}
+                                    </div>
+                                    <div class="dashboard-card-note" style="margin-bottom: 0.45rem;">
+                                        {safe_html(location_address)}
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                                st.dataframe(
+                                    location_df.sort_values(["Item Name", "Item Code"])[location_item_columns],
+                                    width="stretch",
+                                    hide_index=True,
+                                    column_config=column_config
+                                )
+                        else:
+                            st.dataframe(
+                                table_df.sort_values(["Location", "Item Name", "Item Code"])[visible_columns],
+                                width="stretch",
+                                hide_index=True,
+                                column_config=column_config
+                            )
 
-                    with row_cols[0]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell strong">{item_code_safe}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[1]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell strong">{item_name_safe}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[2]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell">{description_safe}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[3]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell">{location_name_safe}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[4]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell">{location_address_safe}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[5]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell strong">{row["quantity"]}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[6]:
-                        st.markdown(
-                            f'<div class="inventory-stream-cell strong">${cost:,.2f}</div>',
-                            unsafe_allow_html=True
-                        )
-                    with row_cols[7]:
-                        if st.button("Edit", key=f"manage_inventory_{row['id']}_{row_index}", type="primary", width="stretch"):
-                            st.session_state.manage_inventory_id = int(row["id"])
-                            st.rerun()
+                    elif inventory_section == "Edit Inventory":
+                        if selected_item is not None:
+                            _, back_col = st.columns([1.55, 0.45])
+                            with back_col:
+                                with st.container(key="inventory_back_to_table"):
+                                    if st.button("Back to Table", type="secondary", width="stretch"):
+                                        st.session_state.manage_inventory_id = None
+                                        st.session_state.manage_inventory_location_id = None
+                                        st.session_state.inventory_view_section = "Edit Inventory"
+                                        st.rerun()
+                        else:
+                            edit_location_filter = st.selectbox(
+                                "Location",
+                                ["All Locations"] + sorted(table_df["Location"].unique().tolist()),
+                                key="inventory_edit_location_filter"
+                            )
+                            edit_table_df = table_df.copy()
+                            if edit_location_filter != "All Locations":
+                                edit_table_df = edit_table_df[edit_table_df["Location"] == edit_location_filter]
 
-                st.markdown('</div>', unsafe_allow_html=True)
+                            if edit_table_df.empty:
+                                st.info("No inventory rows match the selected location.")
+                            else:
+                                header_cols = st.columns(
+                                    [1.0, 1.2, 0.8, 1.0, 1.2, 0.5, 0.8, 0.8, 0.9, 0.7],
+                                    gap=None
+                                )
+                                for col, label in zip(
+                                    header_cols,
+                                    [
+                                        "Location",
+                                        "Address",
+                                        "Item Code",
+                                        "Item Name",
+                                        "Description",
+                                        "Qty",
+                                        "Single Cost",
+                                        "Total Cost",
+                                        "Location Total",
+                                        "Action"
+                                    ]
+                                ):
+                                    with col:
+                                        st.markdown(
+                                            f'<div class="inventory-stream-cell header">{label}</div>',
+                                            unsafe_allow_html=True
+                                        )
 
-                selected_item = None
+                                for row_index, row in edit_table_df.sort_values(
+                                    ["Location", "Item Name", "Item Code"]
+                                ).iterrows():
+                                    row_cols = st.columns(
+                                        [1.0, 1.2, 0.8, 1.0, 1.2, 0.5, 0.8, 0.8, 0.9, 0.7],
+                                        gap=None
+                                    )
+                                    row_values = [
+                                        safe_html(row["Location"]),
+                                        safe_html(row["Address"]),
+                                        safe_html(row["Item Code"]),
+                                        safe_html(row["Item Name"]),
+                                        safe_html(row["Description"]),
+                                        int(row["Quantity"]),
+                                        f"${float(row['Single Cost']):,.2f}",
+                                        f"${float(row['Total Cost']):,.2f}",
+                                        f"${float(row['Location Total Cost']):,.2f}",
+                                    ]
 
-                if "manage_inventory_id" in st.session_state and st.session_state.manage_inventory_id:
-                    selected_rows = df[df["id"] == st.session_state.manage_inventory_id]
-                    if not selected_rows.empty:
-                        selected_item = selected_rows.iloc[0]
+                                    for value_col, value in zip(row_cols[:9], row_values):
+                                        with value_col:
+                                            st.markdown(
+                                                f'<div class="inventory-stream-cell strong">{value}</div>',
+                                                unsafe_allow_html=True
+                                            )
 
-                if selected_item is not None:
+                                    with row_cols[9]:
+                                        if st.button(
+                                            "Edit",
+                                            key=f"manage_inventory_{row['id']}_{row_index}",
+                                            type="primary",
+                                            width="stretch"
+                                        ):
+                                            select_inventory_row(row)
+
+                    elif inventory_section == "Cost Summary by Location":
+                        st.dataframe(
+                            location_summary_df,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Items": st.column_config.NumberColumn("Items"),
+                                "Quantity": st.column_config.NumberColumn("Quantity"),
+                                "Location Total Cost": st.column_config.NumberColumn(
+                                    "Location Total Cost",
+                                    format="$%.2f"
+                                ),
+                            }
+                        )
+
+                if inventory_section == "Edit Inventory" and selected_item is not None:
                     st.markdown('<div class="dashboard-section-title">Edit / Delete Item</div>', unsafe_allow_html=True)
 
                     edit_col, delete_col = st.columns([1.2, 0.8])
 
                     with edit_col:
                         selected_item_id = int(selected_item["id"])
+                        selected_location_id = (
+                            int(selected_item["location_id"])
+                            if "location_id" in selected_item and pd.notna(selected_item["location_id"])
+                            else None
+                        )
+                        selected_update_location_id = selected_location_id
+                        selected_update_location_address = (
+                            str(selected_item["location_address"])
+                            if "location_address" in selected_item
+                            and pd.notna(selected_item["location_address"])
+                            and str(selected_item["location_address"]).strip()
+                            else "No address"
+                        )
 
-                        with st.form(f"edit_inventory_form_{selected_item_id}"):
+                        if is_super_admin():
+                            location_choice_labels = ["Unassigned"]
+                            location_choice_ids = {"Unassigned": None}
+
+                            for _, location_row in inventory_locations_df.iterrows():
+                                location_status = "" if int(location_row["active"]) == 1 else " - Inactive"
+                                location_label = (
+                                    f"{location_row['name']} (ID {int(location_row['id'])}){location_status}"
+                                )
+                                location_choice_labels.append(location_label)
+                                location_choice_ids[location_label] = int(location_row["id"])
+
+                            current_location_label = "Unassigned"
+                            if selected_location_id is not None:
+                                matched_location = inventory_locations_df[
+                                    inventory_locations_df["id"] == selected_location_id
+                                ]
+                                if not matched_location.empty:
+                                    current_location_status = (
+                                        "" if int(matched_location.iloc[0]["active"]) == 1 else " - Inactive"
+                                    )
+                                    current_location_label = (
+                                        f"{matched_location.iloc[0]['name']} (ID {selected_location_id}){current_location_status}"
+                                    )
+
+                            selected_location_choice = st.selectbox(
+                                "Location",
+                                location_choice_labels,
+                                index=(
+                                    location_choice_labels.index(current_location_label)
+                                    if current_location_label in location_choice_labels
+                                    else 0
+                                ),
+                                key=f"edit_inventory_location_selector_{selected_item_id}_{selected_location_id or 'unassigned'}"
+                            )
+                            selected_update_location_id = location_choice_ids[selected_location_choice]
+
+                            if selected_update_location_id is None:
+                                selected_update_location_address = "No address"
+                            else:
+                                selected_update_location_row = inventory_locations_df[
+                                    inventory_locations_df["id"] == selected_update_location_id
+                                ].iloc[0]
+                                selected_update_location_address = (
+                                    str(selected_update_location_row["address"])
+                                    if pd.notna(selected_update_location_row["address"])
+                                    and str(selected_update_location_row["address"]).strip()
+                                    else "No address"
+                                )
+
+                            st.text_area(
+                                "Location Address",
+                                value=selected_update_location_address,
+                                disabled=True,
+                                key=f"edit_inventory_location_address_{selected_item_id}_{selected_update_location_id or 'unassigned'}"
+                            )
+
+                        with st.form(f"edit_inventory_form_{selected_item_id}_{selected_location_id or 'unassigned'}"):
                             edit_item_code = st.text_input(
                                 "Item Code",
                                 value=str(selected_item["item_code"]),
-                                key=f"edit_item_code_{selected_item_id}"
+                                key=f"edit_item_code_{selected_item_id}_{selected_location_id or 'unassigned'}"
                             )
                             edit_item_name = st.text_input(
                                 "Item Name",
                                 value=str(selected_item["item_name"]),
-                                key=f"edit_item_name_{selected_item_id}"
+                                key=f"edit_item_name_{selected_item_id}_{selected_location_id or 'unassigned'}"
                             )
                             edit_description = st.text_area(
                                 "Description",
                                 value=str(selected_item["description"]),
-                                key=f"edit_description_{selected_item_id}"
+                                key=f"edit_description_{selected_item_id}_{selected_location_id or 'unassigned'}"
                             )
                             edit_quantity = st.number_input(
                                 "Quantity",
                                 min_value=0,
                                 step=1,
                                 value=int(selected_item["quantity"]),
-                                key=f"edit_quantity_{selected_item_id}"
+                                key=f"edit_quantity_{selected_item_id}_{selected_location_id or 'unassigned'}"
                             )
                             edit_cost = st.number_input(
-                                "Inventory Cost",
+                                "Single Cost",
                                 min_value=0.0,
                                 step=0.01,
                                 value=float(selected_item["cost"]) if "cost" in selected_item and pd.notna(selected_item["cost"]) else 0.0,
                                 format="%.2f",
-                                key=f"edit_cost_{selected_item_id}"
+                                key=f"edit_cost_{selected_item_id}_{selected_location_id or 'unassigned'}"
+                            )
+                            edit_total_cost = int(edit_quantity) * float(edit_cost)
+                            st.markdown(
+                                f"""
+                                <div class="content-panel">
+                                    <div class="dashboard-card-label">Total Cost</div>
+                                    <div class="dashboard-card-value">${edit_total_cost:,.2f}</div>
+                                    <div class="dashboard-card-note">Quantity multiplied by single cost</div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
                             )
 
                             update_item = st.form_submit_button(
@@ -3512,14 +3989,13 @@ else:
                                     c.execute(
                                         '''
                                         UPDATE inventory
-                                        SET item_code=?, item_name=?, description=?, quantity=?, cost=?
+                                        SET item_code=?, item_name=?, description=?, cost=?
                                         WHERE id=?
                                         ''',
                                         (
                                             new_item_code,
                                             edit_item_name.strip(),
                                             edit_description.strip(),
-                                            edit_quantity,
                                             float(edit_cost),
                                             selected_item_id
                                         )
@@ -3528,52 +4004,134 @@ else:
                                     if old_item_code != new_item_code:
                                         update_item_code_references(c, old_item_code, new_item_code)
 
+                                    if (
+                                        selected_location_id is not None
+                                        and selected_update_location_id != selected_location_id
+                                    ):
+                                        c.execute(
+                                            "DELETE FROM location_inventory WHERE location_id=? AND item_code=?",
+                                            (selected_location_id, new_item_code)
+                                        )
+                                        c.execute(
+                                            "DELETE FROM location_prices WHERE location_id=? AND item_code=?",
+                                            (selected_location_id, new_item_code)
+                                        )
+
+                                    if selected_update_location_id is not None:
+                                        c.execute(
+                                            '''
+                                            INSERT INTO location_inventory (location_id,item_code,quantity)
+                                            VALUES (?,?,?)
+                                            ON CONFLICT(location_id,item_code)
+                                            DO UPDATE SET quantity=excluded.quantity
+                                            ''',
+                                            (selected_update_location_id, new_item_code, int(edit_quantity))
+                                        )
+
+                                    sync_inventory_quantity(c, new_item_code, edit_quantity)
+
                                     conn.commit()
-                                    st.session_state.inventory_message = "Inventory record updated successfully. Related user stock and transaction item codes were synchronized when needed."
+                                    st.session_state.inventory_message = "Inventory item updated successfully."
                                     st.session_state.manage_inventory_id = None
+                                    st.session_state.manage_inventory_location_id = None
+                                    st.session_state.inventory_view_section = "Edit Inventory"
                                     st.rerun()
 
                                 except sqlite3.IntegrityError:
                                     conn.rollback()
-                                    st.error("Another inventory item already uses this code. Choose a unique item code.")
+                                    st.error("Another inventory item or location already uses this name/code. Choose a unique item code and location name.")
 
                                 finally:
                                     conn.close()
 
                     with delete_col:
                         selected_item_name_safe = safe_html(selected_item["item_name"])
+                        selected_location_name = (
+                            str(selected_item["location_name"])
+                            if "location_name" in selected_item and pd.notna(selected_item["location_name"]) and str(selected_item["location_name"]).strip()
+                            else "Unassigned"
+                        )
+                        selected_location_name_safe = safe_html(selected_location_name)
+                        delete_label = "Remove From Location" if selected_location_id is not None else "Delete Item"
+                        delete_note = (
+                            f"This removes the item only from {selected_location_name_safe}. The master item and other locations are kept."
+                            if selected_location_id is not None
+                            else "This removes the master item from inventory. Existing transaction logs are not deleted."
+                        )
+                        confirm_delete_label = (
+                            f"I understand this will remove the selected item from {selected_location_name} only."
+                            if selected_location_id is not None
+                            else "I understand this will delete the selected item everywhere."
+                        )
                         st.markdown(
                             f"""
                             <div class="content-panel">
-                                <div class="dashboard-card-label">Delete Item</div>
+                                <div class="dashboard-card-label">{delete_label}</div>
                                 <div class="item-name" style="font-size: 1.05rem;">{selected_item_name_safe}</div>
-                                <div class="item-meta">This removes the item from inventory. Existing transaction logs are not deleted.</div>
+                                <div class="item-meta">{delete_note}</div>
                             </div>
                             """,
                             unsafe_allow_html=True
                         )
 
                         confirm_delete = st.checkbox(
-                            "I understand this will delete the selected item.",
+                            confirm_delete_label,
                             key="confirm_delete_inventory"
                         )
 
                         if st.button(
-                            "Delete Item",
+                            delete_label,
                             disabled=not confirm_delete,
                             width="stretch"
                         ):
                             conn = get_connection()
                             c = conn.cursor()
-                            delete_item_code_references(c, str(selected_item["item_code"]))
-                            c.execute(
-                                "DELETE FROM inventory WHERE id=?",
-                                (int(selected_item["id"]),)
-                            )
+                            item_code_to_delete = str(selected_item["item_code"])
+
+                            if selected_location_id is not None:
+                                c.execute(
+                                    "DELETE FROM location_inventory WHERE location_id=? AND item_code=?",
+                                    (selected_location_id, item_code_to_delete)
+                                )
+                                c.execute(
+                                    "DELETE FROM location_prices WHERE location_id=? AND item_code=?",
+                                    (selected_location_id, item_code_to_delete)
+                                )
+                                c.execute(
+                                    "SELECT COALESCE(SUM(quantity), 0) FROM location_inventory WHERE item_code=?",
+                                    (item_code_to_delete,)
+                                )
+                                remaining_quantity = int(c.fetchone()[0] or 0)
+                                c.execute(
+                                    "UPDATE inventory SET quantity=? WHERE id=?",
+                                    (remaining_quantity, int(selected_item["id"]))
+                                )
+                                st.session_state.inventory_message = (
+                                    f"{selected_item['item_name']} removed from {selected_location_name}."
+                                )
+                            else:
+                                delete_blockers = get_item_delete_blockers(c, item_code_to_delete)
+                                if delete_blockers:
+                                    st.error(
+                                        "This item cannot be deleted yet because it has related information: "
+                                        + "; ".join(delete_blockers)
+                                        + ". Remove live stock, pricing, and assignments first. "
+                                        + "Items with sales, return, transaction, or transfer history should stay in inventory for records."
+                                    )
+                                    conn.close()
+                                    st.stop()
+                                else:
+                                    c.execute(
+                                        "DELETE FROM inventory WHERE id=?",
+                                        (int(selected_item["id"]),)
+                                    )
+                                    st.session_state.inventory_message = "Inventory item deleted successfully."
+
                             conn.commit()
                             conn.close()
                             st.session_state.manage_inventory_id = None
-                            st.session_state.inventory_message = "Inventory item deleted successfully. Existing transaction history was preserved."
+                            st.session_state.manage_inventory_location_id = None
+                            st.session_state.inventory_view_section = "Edit Inventory"
                             st.rerun()
 
         if menu == "Print QR Codes":
@@ -4020,11 +4578,35 @@ else:
             st.success(st.session_state.locations_message)
             del st.session_state.locations_message
 
-        create_location_col, view_location_col = st.columns([0.9, 1.1])
+        if "locations_section" not in st.session_state:
+            st.session_state.locations_section = "View Locations"
 
-        with create_location_col:
+        with st.container(key="locations_section_buttons"):
+            location_section_cols = st.columns(3, gap="medium")
+            for section_col, section_label in zip(
+                location_section_cols,
+                ["View Locations", "Create Location", "Assign Users"]
+            ):
+                with section_col:
+                    if st.button(
+                        section_label,
+                        key=f"locations_section_{section_label.replace(' ', '_').lower()}",
+                        type=(
+                            "primary"
+                            if st.session_state.locations_section == section_label
+                            else "secondary"
+                        ),
+                        width="stretch"
+                    ):
+                        if section_label != "View Locations":
+                            st.session_state.selected_location_edit_id = None
+                        st.session_state.locations_section = section_label
+                        st.rerun()
+
+        owner_options = [""] + users_df["username"].tolist() if not users_df.empty else [""]
+
+        if st.session_state.locations_section == "Create Location":
             st.markdown('<div class="dashboard-section-title">Create Location</div>', unsafe_allow_html=True)
-            owner_options = [""] + users_df["username"].tolist() if not users_df.empty else [""]
 
             with st.form("create_location_form"):
                 location_name = st.text_input("Location Name")
@@ -4061,7 +4643,7 @@ else:
                     finally:
                         conn.close()
 
-        with view_location_col:
+        elif st.session_state.locations_section == "View Locations":
             st.markdown('<div class="dashboard-section-title">Existing Locations</div>', unsafe_allow_html=True)
 
             if locations_df.empty:
@@ -4069,184 +4651,300 @@ else:
             else:
                 display_locations_df = locations_df.copy()
                 display_locations_df["status"] = display_locations_df["active"].map({1: "Active", 0: "Inactive"})
-                location_status_filter = st.selectbox(
-                    "Filter Location Status",
-                    ["All", "Active", "Inactive"],
-                    key="location_status_filter"
-                )
+                selected_location_id = st.session_state.get("selected_location_edit_id")
+                selected_location = None
 
-                if location_status_filter != "All":
-                    display_locations_df = display_locations_df[
-                        display_locations_df["status"] == location_status_filter
-                    ].copy()
+                if selected_location_id:
+                    selected_location_rows = locations_df[locations_df["id"] == selected_location_id]
+                    if not selected_location_rows.empty:
+                        selected_location = selected_location_rows.iloc[0]
 
-                st.dataframe(
-                    display_locations_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "id": "ID",
-                        "name": "Location",
-                        "address": "Address / Notes",
-                        "owner_username": "Owner/Admin",
-                        "active": None,
-                        "status": "Status",
-                        "created_at": "Created",
-                    }
-                )
-
-                st.markdown('<div class="dashboard-section-title">Edit Location</div>', unsafe_allow_html=True)
-                location_ids = locations_df["id"].astype(int).tolist()
-                selected_location_id = st.selectbox(
-                    "Select Location",
-                    location_ids,
-                    format_func=lambda location_id: (
-                        f"{locations_df.loc[locations_df['id'] == location_id, 'name'].iloc[0]} (ID {location_id})"
-                    ),
-                    key="edit_location_id"
-                )
-                selected_location = locations_df[locations_df["id"] == selected_location_id].iloc[0]
-                owner_options = [""] + users_df["username"].tolist() if not users_df.empty else [""]
-                current_owner = selected_location["owner_username"] if pd.notna(selected_location["owner_username"]) else ""
-                owner_index = owner_options.index(current_owner) if current_owner in owner_options else 0
-
-                with st.form("edit_location_form"):
-                    edited_location_name = st.text_input(
-                        "Location Name",
-                        value=selected_location["name"],
-                        key=f"edit_location_name_{selected_location_id}"
+                if selected_location is None:
+                    location_status_filter = st.selectbox(
+                        "Filter Location Status",
+                        ["All", "Active", "Inactive"],
+                        key="location_status_filter"
                     )
-                    edited_location_address = st.text_area(
-                        "Address / Notes",
-                        value=selected_location["address"] if pd.notna(selected_location["address"]) else "",
-                        key=f"edit_location_address_{selected_location_id}"
-                    )
-                    edited_owner_username = st.selectbox(
-                        "Owner/Admin",
-                        owner_options,
-                        index=owner_index,
-                        key=f"edit_location_owner_{selected_location_id}"
-                    )
-                    edited_active = st.checkbox(
-                        "Active",
-                        value=bool(selected_location["active"]),
-                        key=f"edit_location_active_{selected_location_id}"
-                    )
-                    update_location = st.form_submit_button("Update Location", type="primary", width="stretch")
 
-                if update_location:
-                    if not edited_location_name.strip():
-                        st.error("Location name is required before this storage location can be updated.")
-                    else:
-                        conn = get_connection()
-                        c = conn.cursor()
+                    if location_status_filter != "All":
+                        display_locations_df = display_locations_df[
+                            display_locations_df["status"] == location_status_filter
+                        ].copy()
 
-                        try:
-                            c.execute(
-                                '''
-                                UPDATE locations
-                                SET name=?, address=?, owner_username=?, active=?
-                                WHERE id=?
-                                ''',
-                                (
-                                    edited_location_name.strip(),
-                                    edited_location_address.strip(),
-                                    edited_owner_username or None,
-                                    1 if edited_active else 0,
-                                    selected_location_id
-                                )
+                    location_header_cols = st.columns([0.45, 1.1, 1.4, 1.0, 0.75, 1.0, 0.65], gap=None)
+                    for col, label in zip(
+                        location_header_cols,
+                        ["ID", "Location", "Address / Notes", "Owner/Admin", "Status", "Created", "Action"]
+                    ):
+                        with col:
+                            st.markdown(
+                                f'<div class="inventory-stream-cell header">{label}</div>',
+                                unsafe_allow_html=True
                             )
-                            conn.commit()
-                            st.session_state.locations_message = "Location updated successfully."
-                            st.rerun()
-                        except sqlite3.IntegrityError:
-                            st.error("A location with this name already exists. Use a unique location name.")
-                        finally:
-                            conn.close()
 
-        st.markdown("---")
-        st.markdown('<div class="dashboard-section-title">Assign Users to Locations</div>', unsafe_allow_html=True)
+                    for row_index, row in display_locations_df.iterrows():
+                        location_row_cols = st.columns([0.45, 1.1, 1.4, 1.0, 0.75, 1.0, 0.65], gap=None)
+                        location_values = [
+                            int(row["id"]),
+                            safe_html(row["name"]),
+                            safe_html(row["address"] if pd.notna(row["address"]) else ""),
+                            safe_html(row["owner_username"] if pd.notna(row["owner_username"]) else "Unassigned"),
+                            safe_html(row["status"]),
+                            safe_html(row["created_at"] if pd.notna(row["created_at"]) else ""),
+                        ]
 
-        if locations_df.empty or users_df.empty:
-            st.info("Create at least one location and one admin or sales user before assigning location access.")
-        else:
-            assignment_col, assignment_table_col = st.columns([0.9, 1.1])
+                        for value_col, value in zip(location_row_cols[:6], location_values):
+                            with value_col:
+                                st.markdown(
+                                    f'<div class="inventory-stream-cell strong">{value}</div>',
+                                    unsafe_allow_html=True
+                                )
 
-            with assignment_col:
-                assignable_users_df = users_df[users_df["role"].isin(["admin", "sales"])]
-
-                if assignable_users_df.empty:
-                    st.info("Create an admin or sales user before assigning them to a location.")
+                        with location_row_cols[6]:
+                            if st.button(
+                                "Edit",
+                                key=f"edit_location_row_{row['id']}_{row_index}",
+                                type="primary",
+                                width="stretch"
+                            ):
+                                st.session_state.selected_location_edit_id = int(row["id"])
+                                st.session_state.locations_section = "View Locations"
+                                st.rerun()
                 else:
-                    assignment_user = st.selectbox(
-                        "User",
-                        assignable_users_df["username"].tolist(),
-                        key="assignment_user"
-                    )
-                    assignment_location_options = {
-                        f"{row['name']} (ID {row['id']})": int(row["id"])
-                        for _, row in locations_df.iterrows()
-                    }
-                    assignment_location = st.selectbox(
-                        "Location",
-                        list(assignment_location_options.keys()),
-                        key="assignment_location"
-                    )
+                    _, back_col = st.columns([1.55, 0.45])
+                    with back_col:
+                        with st.container(key="location_back_to_table"):
+                            if st.button("Back to Table", type="secondary", width="stretch"):
+                                st.session_state.selected_location_edit_id = None
+                                st.session_state.locations_section = "View Locations"
+                                st.rerun()
 
-                    assign_col, remove_col = st.columns(2)
+                    st.markdown('<div class="dashboard-section-title">Edit / Delete Location</div>', unsafe_allow_html=True)
+                    edit_location_col, delete_location_col = st.columns([1.2, 0.8])
+                    selected_location_id = int(selected_location["id"])
+                    current_owner = selected_location["owner_username"] if pd.notna(selected_location["owner_username"]) else ""
+                    owner_index = owner_options.index(current_owner) if current_owner in owner_options else 0
 
-                    with assign_col:
-                        if st.button("Assign Location", type="primary", width="stretch"):
+                    with edit_location_col:
+                        with st.form(f"edit_location_form_{selected_location_id}"):
+                            edited_location_name = st.text_input(
+                                "Location Name",
+                                value=selected_location["name"],
+                                key=f"edit_location_name_{selected_location_id}"
+                            )
+                            edited_location_address = st.text_area(
+                                "Address / Notes",
+                                value=selected_location["address"] if pd.notna(selected_location["address"]) else "",
+                                key=f"edit_location_address_{selected_location_id}"
+                            )
+                            edited_owner_username = st.selectbox(
+                                "Owner/Admin",
+                                owner_options,
+                                index=owner_index,
+                                key=f"edit_location_owner_{selected_location_id}"
+                            )
+                            edited_active = st.checkbox(
+                                "Active",
+                                value=bool(selected_location["active"]),
+                                key=f"edit_location_active_{selected_location_id}"
+                            )
+                            update_location = st.form_submit_button("Update Location", type="primary", width="stretch")
+
+                        if update_location:
+                            if not edited_location_name.strip():
+                                st.error("Location name is required before this storage location can be updated.")
+                            else:
+                                conn = get_connection()
+                                c = conn.cursor()
+
+                                try:
+                                    c.execute(
+                                        '''
+                                        UPDATE locations
+                                        SET name=?, address=?, owner_username=?, active=?
+                                        WHERE id=?
+                                        ''',
+                                        (
+                                            edited_location_name.strip(),
+                                            edited_location_address.strip(),
+                                            edited_owner_username or None,
+                                            1 if edited_active else 0,
+                                            selected_location_id
+                                        )
+                                    )
+                                    conn.commit()
+                                    st.session_state.selected_location_edit_id = None
+                                    st.session_state.locations_section = "View Locations"
+                                    st.session_state.locations_message = "Location updated successfully."
+                                    st.rerun()
+                                except sqlite3.IntegrityError:
+                                    st.error("A location with this name already exists. Use a unique location name.")
+                                finally:
+                                    conn.close()
+
+                    with delete_location_col:
+                        selected_location_name_safe = safe_html(selected_location["name"])
+                        st.warning(
+                            "Deleting a location is only allowed when it has no stock units and no invoice, return, or transfer history. "
+                            "For locations with history, turn off Active instead."
+                        )
+                        st.markdown(
+                            f"""
+                            <div class="content-panel">
+                                <div class="dashboard-card-label">Delete Location</div>
+                                <div class="item-name" style="font-size: 1.05rem;">{selected_location_name_safe}</div>
+                                <div class="item-meta">This permanently removes the selected location only when it is safe to delete.</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        confirm_delete_location = st.checkbox(
+                            "I understand this will permanently delete the selected location when it is safe to remove.",
+                            key=f"confirm_delete_location_{selected_location_id}"
+                        )
+
+                        if st.button(
+                            "Delete Location",
+                            disabled=not confirm_delete_location,
+                            key=f"delete_location_{selected_location_id}",
+                            width="stretch"
+                        ):
                             conn = get_connection()
                             c = conn.cursor()
 
                             try:
                                 c.execute(
+                                    "SELECT COALESCE(SUM(quantity), 0) FROM location_inventory WHERE location_id=?",
+                                    (selected_location_id,)
+                                )
+                                stock_units = int(c.fetchone()[0] or 0)
+                                c.execute("SELECT COUNT(*) FROM invoices WHERE location_id=?", (selected_location_id,))
+                                invoice_count = int(c.fetchone()[0] or 0)
+                                c.execute("SELECT COUNT(*) FROM returns WHERE location_id=?", (selected_location_id,))
+                                return_count = int(c.fetchone()[0] or 0)
+                                c.execute(
                                     '''
-                                    INSERT INTO user_locations (username, location_id)
-                                    VALUES (?,?)
+                                    SELECT COUNT(*) FROM inventory_transfers
+                                    WHERE source_location_id=? OR destination_location_id=?
+                                    ''',
+                                    (selected_location_id, selected_location_id)
+                                )
+                                transfer_count = int(c.fetchone()[0] or 0)
+
+                                delete_blockers = []
+                                if stock_units > 0:
+                                    delete_blockers.append(f"{stock_units} stock unit(s)")
+                                if invoice_count > 0:
+                                    delete_blockers.append(f"{invoice_count} invoice(s)")
+                                if return_count > 0:
+                                    delete_blockers.append(f"{return_count} return record(s)")
+                                if transfer_count > 0:
+                                    delete_blockers.append(f"{transfer_count} transfer record(s)")
+
+                                if delete_blockers:
+                                    st.error(
+                                        "This location cannot be deleted because it has "
+                                        + ", ".join(delete_blockers)
+                                        + ". Set it to inactive instead to preserve history."
+                                    )
+                                else:
+                                    c.execute("BEGIN IMMEDIATE")
+                                    c.execute("DELETE FROM user_locations WHERE location_id=?", (selected_location_id,))
+                                    c.execute("DELETE FROM location_prices WHERE location_id=?", (selected_location_id,))
+                                    c.execute("DELETE FROM location_inventory WHERE location_id=?", (selected_location_id,))
+                                    c.execute("DELETE FROM locations WHERE id=?", (selected_location_id,))
+                                    conn.commit()
+                                    st.session_state.selected_location_edit_id = None
+                                    st.session_state.locations_section = "View Locations"
+                                    st.session_state.locations_message = "Location deleted successfully."
+                                    st.rerun()
+
+                            finally:
+                                conn.close()
+
+        elif st.session_state.locations_section == "Assign Users":
+            st.markdown('<div class="dashboard-section-title">Assign Users to Locations</div>', unsafe_allow_html=True)
+
+            if locations_df.empty or users_df.empty:
+                st.info("Create at least one location and one admin or sales user before assigning location access.")
+            else:
+                assignment_col, assignment_table_col = st.columns([0.9, 1.1])
+
+                with assignment_col:
+                    assignable_users_df = users_df[users_df["role"].isin(["admin", "sales"])]
+
+                    if assignable_users_df.empty:
+                        st.info("Create an admin or sales user before assigning them to a location.")
+                    else:
+                        assignment_user = st.selectbox(
+                            "User",
+                            assignable_users_df["username"].tolist(),
+                            key="assignment_user"
+                        )
+                        assignment_location_options = {
+                            f"{row['name']} (ID {row['id']})": int(row["id"])
+                            for _, row in locations_df.iterrows()
+                        }
+                        assignment_location = st.selectbox(
+                            "Location",
+                            list(assignment_location_options.keys()),
+                            key="assignment_location"
+                        )
+
+                        assign_col, remove_col = st.columns(2)
+
+                        with assign_col:
+                            if st.button("Assign Location", type="primary", width="stretch"):
+                                conn = get_connection()
+                                c = conn.cursor()
+
+                                try:
+                                    c.execute(
+                                        '''
+                                        INSERT INTO user_locations (username, location_id)
+                                        VALUES (?,?)
+                                        ''',
+                                        (assignment_user, assignment_location_options[assignment_location])
+                                    )
+                                    conn.commit()
+                                    st.session_state.locations_message = "Location assignment saved."
+                                    st.rerun()
+                                except sqlite3.IntegrityError:
+                                    st.info("This user already has access to the selected location.")
+                                finally:
+                                    conn.close()
+
+                        with remove_col:
+                            if st.button("Remove Assignment", width="stretch"):
+                                conn = get_connection()
+                                c = conn.cursor()
+                                c.execute(
+                                    '''
+                                    DELETE FROM user_locations
+                                    WHERE username=? AND location_id=?
                                     ''',
                                     (assignment_user, assignment_location_options[assignment_location])
                                 )
                                 conn.commit()
-                                st.session_state.locations_message = "Location assignment saved."
-                                st.rerun()
-                            except sqlite3.IntegrityError:
-                                st.info("This user already has access to the selected location.")
-                            finally:
                                 conn.close()
+                                st.session_state.locations_message = "Location assignment removed."
+                                st.rerun()
 
-                    with remove_col:
-                        if st.button("Remove Assignment", width="stretch"):
-                            conn = get_connection()
-                            c = conn.cursor()
-                            c.execute(
-                                '''
-                                DELETE FROM user_locations
-                                WHERE username=? AND location_id=?
-                                ''',
-                                (assignment_user, assignment_location_options[assignment_location])
-                            )
-                            conn.commit()
-                            conn.close()
-                            st.session_state.locations_message = "Location assignment removed."
-                            st.rerun()
-
-            with assignment_table_col:
-                if assignments_df.empty:
-                    st.info("No location assignments exist yet. Assign admins or sales users to locations to enable role-scoped access.")
-                else:
-                    st.dataframe(
-                        assignments_df,
-                        width="stretch",
-                        hide_index=True,
-                        column_config={
-                            "id": "ID",
-                            "username": "User",
-                            "role": "Role",
-                            "location": "Location",
-                        }
-                    )
+                with assignment_table_col:
+                    if assignments_df.empty:
+                        st.info("No location assignments exist yet. Assign admins or sales users to locations to enable role-scoped access.")
+                    else:
+                        st.dataframe(
+                            assignments_df,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "id": "ID",
+                                "username": "User",
+                                "role": "Role",
+                                "location": "Location",
+                            }
+                        )
 
     if menu == "Location Inventory" and has_admin_access():
         conn = get_connection()
