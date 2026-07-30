@@ -89,7 +89,9 @@ def consume_invoice_location_ownership(cursor, role, username, location_id, item
     return 0
 
 
-def record_return_stock(conn, username, role, location_id, item_code, quantity, reason, condition_status):
+def record_return_stock(
+    conn, username, role, location_id, item_code, quantity, reason, condition_status, invoice_id=None
+):
     """Apply a completed return/damage transaction and return its stock impact."""
     quantity = int(quantity)
     reason = str(reason or "").strip()
@@ -112,19 +114,28 @@ def record_return_stock(conn, username, role, location_id, item_code, quantity, 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if is_customer_return:
+            if invoice_id is None:
+                raise ValueError("Select the customer invoice associated with this return.")
             c.execute(
-                '''SELECT COALESCE(SUM(ii.quantity),0)
+                '''SELECT COALESCE(SUM(ii.quantity),0), inv.created_by
                    FROM invoice_items ii JOIN invoices inv ON inv.id=ii.invoice_id
-                   WHERE inv.location_id=? AND LOWER(ii.item_code)=LOWER(?)
-                     AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')''',
-                (location_id, item_code)
+                   WHERE inv.id=? AND inv.location_id=? AND LOWER(ii.item_code)=LOWER(?)
+                     AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')
+                   GROUP BY inv.id''',
+                (invoice_id, location_id, item_code)
             )
-            sold_quantity = int(c.fetchone()[0] or 0)
+            invoice_row = c.fetchone()
+            if not invoice_row:
+                raise ValueError("Only 0 can be returned for the selected invoice and item.")
+            sold_quantity = int(invoice_row[0] or 0) if invoice_row else 0
+            invoice_creator = str(invoice_row[1] or "") if invoice_row else ""
+            if role in {"admin", "sales"} and invoice_creator.lower() != str(username).lower():
+                raise ValueError("You can only receive returns for invoices you created.")
             c.execute(
                 '''SELECT COALESCE(SUM(quantity),0) FROM returns
-                   WHERE location_id=? AND LOWER(item_code)=LOWER(?)
+                   WHERE invoice_id=? AND location_id=? AND LOWER(item_code)=LOWER(?)
                      AND condition_status='customer_return' AND status='completed' ''',
-                (location_id, item_code)
+                (invoice_id, location_id, item_code)
             )
             returned_quantity = int(c.fetchone()[0] or 0)
             returnable_quantity = max(sold_quantity - returned_quantity, 0)
@@ -167,6 +178,8 @@ def record_return_stock(conn, username, role, location_id, item_code, quantity, 
                     (username, location_id, item_code, quantity)
                 )
         else:
+            if role == "sales":
+                raise ValueError("Sales users cannot record damaged or unsellable stock.")
             removable_quantity = quantity_before
             if role == "admin":
                 c.execute(
@@ -194,7 +207,14 @@ def record_return_stock(conn, username, role, location_id, item_code, quantity, 
                     (quantity, username, location_id, item_code)
                 )
             else:
-                remaining = quantity
+                c.execute(
+                    '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                       WHERE location_id=? AND LOWER(item_code)=LOWER(?) AND quantity>0''',
+                    (location_id, item_code)
+                )
+                total_owned = int(c.fetchone()[0] or 0)
+                generic_quantity = max(quantity_before - total_owned, 0)
+                remaining = max(quantity - generic_quantity, 0)
                 c.execute(
                     '''SELECT username,quantity FROM admin_location_stock
                        WHERE location_id=? AND LOWER(item_code)=LOWER(?) AND quantity>0 ORDER BY id''',
@@ -215,9 +235,9 @@ def record_return_stock(conn, username, role, location_id, item_code, quantity, 
         c.execute(
             '''INSERT INTO returns
                (location_id,item_code,quantity,reason,condition_status,recorded_by,status,created_at,
-                quantity_before,quantity_after,inventory_action) VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                quantity_before,quantity_after,inventory_action,invoice_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
             (location_id, item_code, quantity, reason, condition_status, username, "completed", now,
-             quantity_before, quantity_after, inventory_action)
+             quantity_before, quantity_after, inventory_action, invoice_id)
         )
         c.execute(
             '''INSERT INTO location_stock_history
@@ -276,7 +296,7 @@ def render_returns_damage_records(returns_df):
 
     return_display_df = return_display_df[
         [
-            "location", "item_code", "item_name", "quantity_before", "quantity",
+            "invoice_id", "location", "item_code", "item_name", "quantity_before", "quantity",
             "quantity_after", "inventory_action", "condition_status", "status",
             "recorded_by", "created_at", "reason",
         ]
@@ -286,6 +306,7 @@ def render_returns_damage_records(returns_df):
         width="stretch",
         hide_index=True,
         column_config={
+            "invoice_id": "Invoice ID",
             "location": "Location",
             "item_code": "Item Code",
             "item_name": "Item Name",
@@ -1736,7 +1757,9 @@ def render(menu):
                             "Super Admin should increase Assigned Quantity before more stock can be added."
                         )
 
-                with st.form(f"location_inventory_form_{stock_mode_key}"):
+                # Keep stock and price controls outside a form so Streamlit reruns on
+                # every edit and both Admin and Super Admin previews stay live.
+                with st.container(border=True):
                     location_quantity = st.number_input(
                         location_quantity_label,
                         min_value=0,
@@ -1864,7 +1887,41 @@ def render(menu):
                             f"Selling Price is separate from Single Cost / Purchase Cost. "
                             f"Purchase cost for this item is ${selected_purchase_cost:,.2f}."
                         )
-                    save_location_stock = st.form_submit_button("Save Stock / Price", type="primary", width="stretch")
+                    cleaned_price_preview = location_price_text.strip()
+                    try:
+                        live_price_preview = float(cleaned_price_preview) if cleaned_price_preview else 0.0
+                        live_price_is_numeric = True
+                    except ValueError:
+                        live_price_preview = 0.0
+                        live_price_is_numeric = False
+                    live_stock_after = (
+                        selected_location_after_save
+                        if is_super_admin()
+                        else new_location_quantity_preview
+                    )
+                    live_available_after = max(
+                        max_for_selected_location - int(location_quantity), 0
+                    )
+                    live_preview_cols = st.columns(4)
+                    live_preview_cols[0].metric("Physical Stock Now", current_location_quantity)
+                    live_preview_cols[1].metric("Stock After Save", live_stock_after)
+                    live_preview_cols[2].metric("Available After Save", live_available_after)
+                    live_preview_cols[3].metric(
+                        "Selling Price After Save",
+                        f"${live_price_preview:,.2f}" if live_price_is_numeric else "Invalid"
+                    )
+                    if not live_price_is_numeric:
+                        st.error("Selling Price must be a valid number.")
+                    elif cleaned_price_preview and live_price_preview <= selected_purchase_cost:
+                        st.warning(
+                            f"Selling Price must be greater than purchase cost (${selected_purchase_cost:,.2f})."
+                        )
+                    save_location_stock = st.button(
+                        "Save Stock / Price",
+                        type="primary",
+                        width="stretch",
+                        key=f"save_location_stock_{location_id}_{item_code}_{form_reset_counter}"
+                    )
 
                 if save_location_stock:
                     cleaned_location_price = location_price_text.strip()
@@ -2616,6 +2673,63 @@ def render(menu):
                             """,
                             unsafe_allow_html=True
                         )
+                        preview_customer = safe_html(customer_name.strip() or "Customer name not entered")
+                        preview_location = safe_html(invoice_location)
+                        preview_item_name = safe_html(str(selected_item_row["item_name"] or item_code))
+                        preview_item_code = safe_html(item_code)
+                        preview_quantity_text = (
+                            f"{invoice_quantity_preview:,}" if invoice_quantity is not None else "—"
+                        )
+                        st.markdown(
+                            f"""
+                            <div style="background:#ffffff;border:1px solid #dbe3ee;border-radius:16px;padding:22px;margin-top:14px;box-shadow:0 8px 24px rgba(15,23,42,.06);">
+                                <div style="display:flex;justify-content:space-between;gap:20px;border-bottom:2px solid #e5e7eb;padding-bottom:16px;margin-bottom:18px;">
+                                    <div>
+                                        <div style="font-size:12px;font-weight:800;letter-spacing:.12em;color:#64748b;">LIVE DRAFT</div>
+                                        <div style="font-size:26px;font-weight:800;color:#172033;">INVOICE</div>
+                                    </div>
+                                    <div style="text-align:right;color:#475569;font-size:13px;">
+                                        <div><strong>Invoice #:</strong> Assigned after save</div>
+                                        <div><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d')}</div>
+                                    </div>
+                                </div>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px;">
+                                    <div>
+                                        <div style="font-size:11px;font-weight:800;color:#64748b;text-transform:uppercase;">Bill To</div>
+                                        <div style="font-size:16px;font-weight:700;color:#172033;">{preview_customer}</div>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <div style="font-size:11px;font-weight:800;color:#64748b;text-transform:uppercase;">Fulfilled From</div>
+                                        <div style="font-size:16px;font-weight:700;color:#172033;">{preview_location}</div>
+                                    </div>
+                                </div>
+                                <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                                    <thead>
+                                        <tr style="background:#f1f5f9;color:#334155;text-align:left;">
+                                            <th style="padding:11px;">Item</th>
+                                            <th style="padding:11px;text-align:right;">Quantity</th>
+                                            <th style="padding:11px;text-align:right;">Unit Price</th>
+                                            <th style="padding:11px;text-align:right;">Line Total</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr style="border-bottom:1px solid #e5e7eb;">
+                                            <td style="padding:13px 11px;"><strong>{preview_item_name}</strong><br><span style="color:#64748b;">{preview_item_code}</span></td>
+                                            <td style="padding:13px 11px;text-align:right;">{preview_quantity_text}</td>
+                                            <td style="padding:13px 11px;text-align:right;">${float(invoice_unit_price):,.2f}</td>
+                                            <td style="padding:13px 11px;text-align:right;font-weight:700;">${invoice_total_preview:,.2f}</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                                <div style="margin-left:auto;margin-top:16px;max-width:310px;">
+                                    <div style="display:flex;justify-content:space-between;padding:7px 0;color:#475569;"><span>Subtotal</span><span>${invoice_total_preview:,.2f}</span></div>
+                                    <div style="display:flex;justify-content:space-between;padding:11px 0;border-top:2px solid #172033;font-size:19px;font-weight:800;color:#172033;"><span>Total</span><span>${invoice_total_preview:,.2f}</span></div>
+                                    <div style="display:flex;justify-content:space-between;padding:7px 0;color:#0f766e;font-weight:700;"><span>Amount Due</span><span>${invoice_total_preview:,.2f}</span></div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
                         st.caption(
                             "Live preview only — stock and invoice records are not saved until Create Invoice is clicked."
                         )
@@ -2623,7 +2737,7 @@ def render(menu):
                             "Create Invoice",
                             type="primary",
                             width="stretch",
-                            disabled=invoice_quantity is None,
+                            disabled=invoice_quantity is None or not customer_name.strip(),
                             key=f"create_invoice_{location_id}_{item_code}"
                         )
 
@@ -3011,7 +3125,7 @@ def render(menu):
         )
         returns_df = pd.read_sql_query(
             '''
-            SELECT r.id, r.location_id, l.name AS location, r.item_code, i.item_name, r.quantity, r.reason,
+            SELECT r.id, r.invoice_id, r.location_id, l.name AS location, r.item_code, i.item_name, r.quantity, r.reason,
                    r.condition_status, r.recorded_by, r.status, r.created_at,
                    r.quantity_before, r.quantity_after, r.inventory_action
             FROM returns r
@@ -3059,6 +3173,8 @@ def render(menu):
 
         if st.session_state.get("returns_page_mode") not in {"customer_return", "damage", "view"}:
             st.session_state.returns_page_mode = "customer_return"
+        if get_current_role() == "sales" and st.session_state.returns_page_mode == "damage":
+            st.session_state.returns_page_mode = "customer_return"
         return_page_col, damage_page_col, view_page_col = st.columns(3)
         with return_page_col:
             if st.button(
@@ -3074,7 +3190,8 @@ def render(menu):
                 "Damage / Bad Item",
                 type="primary" if st.session_state.returns_page_mode == "damage" else "secondary",
                 width="stretch",
-                key="show_damage_page"
+                key="show_damage_page",
+                disabled=get_current_role() == "sales"
             ):
                 st.session_state.returns_page_mode = "damage"
                 st.rerun()
@@ -3113,9 +3230,54 @@ def render(menu):
                 }
                 selected_location = st.selectbox("Location", list(location_options.keys()), key="return_location")
                 location_id = location_options[selected_location]
+                selected_return_invoice_id = None
 
                 if is_customer_return:
-                    eligible_items_df = inventory_df.copy()
+                    invoice_conn = get_connection()
+                    creator_filter = ""
+                    invoice_params = [location_id]
+                    if get_current_role() in {"admin", "sales"}:
+                        creator_filter = " AND LOWER(inv.created_by)=LOWER(?)"
+                        invoice_params.append(st.session_state.username)
+                    eligible_items_df = pd.read_sql_query(
+                        f'''SELECT inv.id AS invoice_id, inv.invoice_number, inv.customer_name,
+                                  ii.item_code, i.item_name, ii.quantity AS sold_quantity,
+                                  COALESCE((SELECT SUM(r.quantity) FROM returns r
+                                            WHERE r.invoice_id=inv.id
+                                              AND LOWER(r.item_code)=LOWER(ii.item_code)
+                                              AND r.condition_status='customer_return'
+                                              AND r.status='completed'),0) AS returned_quantity
+                           FROM invoices inv
+                           JOIN invoice_items ii ON ii.invoice_id=inv.id
+                           LEFT JOIN inventory i ON LOWER(i.item_code)=LOWER(ii.item_code)
+                           WHERE inv.location_id=?
+                             AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')
+                             {creator_filter}
+                           ORDER BY inv.id DESC''',
+                        invoice_conn,
+                        params=tuple(invoice_params)
+                    )
+                    invoice_conn.close()
+                    if not eligible_items_df.empty:
+                        eligible_items_df["returnable_quantity"] = (
+                            eligible_items_df["sold_quantity"].astype(int)
+                            - eligible_items_df["returned_quantity"].astype(int)
+                        ).clip(lower=0)
+                        eligible_items_df = eligible_items_df[
+                            eligible_items_df["returnable_quantity"] > 0
+                        ].copy()
+                    if not eligible_items_df.empty:
+                        invoice_options = {
+                            f"{row['invoice_number']} - {row['customer_name']}": int(row["invoice_id"])
+                            for _, row in eligible_items_df.drop_duplicates("invoice_id").iterrows()
+                        }
+                        selected_invoice = st.selectbox(
+                            "Customer Invoice", list(invoice_options), key="return_invoice"
+                        )
+                        selected_return_invoice_id = invoice_options[selected_invoice]
+                        eligible_items_df = eligible_items_df[
+                            eligible_items_df["invoice_id"] == selected_return_invoice_id
+                        ].copy()
                 else:
                     eligible_items_df = return_stock_df[
                         return_stock_df["location_id"] == location_id
@@ -3145,8 +3307,69 @@ def render(menu):
                         f"Current physical stock here: {current_stock}. Saving will {stock_effect} this quantity immediately."
                     )
 
-                    with st.form(f"record_return_form_{st.session_state.returns_damage_mode}"):
-                        return_quantity = st.number_input("Quantity", min_value=1, step=1)
+                    limit_conn = get_connection()
+                    limit_c = limit_conn.cursor()
+                    try:
+                        if is_customer_return:
+                            limit_c.execute(
+                                '''SELECT COALESCE(SUM(ii.quantity),0) FROM invoice_items ii
+                                   JOIN invoices inv ON inv.id=ii.invoice_id
+                                   WHERE inv.id=? AND inv.location_id=? AND LOWER(ii.item_code)=LOWER(?)
+                                     AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')''',
+                                (selected_return_invoice_id, location_id, item_code)
+                            )
+                            sold_quantity_preview = int(limit_c.fetchone()[0] or 0)
+                            limit_c.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                   WHERE invoice_id=? AND location_id=? AND LOWER(item_code)=LOWER(?)
+                                     AND condition_status='customer_return' AND status='completed' ''',
+                                (selected_return_invoice_id, location_id, item_code)
+                            )
+                            maximum_allowed = max(
+                                sold_quantity_preview - int(limit_c.fetchone()[0] or 0), 0
+                            )
+                            if get_current_role() == "admin":
+                                limit_c.execute(
+                                    '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                assigned_preview = int(limit_c.fetchone()[0] or 0)
+                                limit_c.execute(
+                                    '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                remaining_assignment_preview = max(
+                                    assigned_preview - int(limit_c.fetchone()[0] or 0), 0
+                                )
+                                maximum_allowed = min(maximum_allowed, remaining_assignment_preview)
+                        else:
+                            maximum_allowed = current_stock
+                            if get_current_role() == "admin":
+                                limit_c.execute(
+                                    '''SELECT COALESCE(quantity,0) FROM admin_location_stock
+                                       WHERE LOWER(username)=LOWER(?) AND location_id=?
+                                         AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, location_id, item_code)
+                                )
+                                maximum_allowed = min(
+                                    current_stock, int(limit_c.fetchone()[0] or 0)
+                                )
+                    finally:
+                        limit_conn.close()
+
+                    # These controls intentionally stay outside st.form so the
+                    # before/after preview reruns immediately on every edit.
+                    with st.container(border=True):
+                        return_quantity = st.number_input(
+                            "Quantity",
+                            min_value=1,
+                            value=None,
+                            step=1,
+                            placeholder="Enter quantity",
+                            key=f"return_quantity_{st.session_state.returns_damage_mode}_{location_id}_{item_code}"
+                        )
                         if is_customer_return:
                             condition_status = "customer_return"
                             st.info(
@@ -3157,17 +3380,37 @@ def render(menu):
                             condition_status = st.selectbox(
                                 "Condition", ["damaged", "defective", "expired", "bad"]
                             )
-                        return_reason = st.text_area("Reason")
-                        quantity_after_preview = (
-                            current_stock + int(return_quantity)
-                            if is_customer_return
-                            else max(current_stock - int(return_quantity), 0)
+                        return_reason = st.text_area(
+                            "Reason",
+                            key=f"return_reason_{st.session_state.returns_damage_mode}_{location_id}_{item_code}"
                         )
-                        preview_col1, preview_col2 = st.columns(2)
+                        return_quantity_preview = int(return_quantity or 0)
+                        quantity_after_preview = (
+                            current_stock + return_quantity_preview
+                            if is_customer_return
+                            else max(current_stock - return_quantity_preview, 0)
+                        )
+                        quantity_is_valid = (
+                            return_quantity is not None
+                            and return_quantity_preview > 0
+                            and return_quantity_preview <= maximum_allowed
+                        )
+                        preview_col1, preview_col2, preview_col3 = st.columns(3)
                         preview_col1.metric("Physical Stock Now", current_stock)
-                        preview_col2.metric("After Save", quantity_after_preview)
+                        preview_col2.metric("Maximum Allowed", maximum_allowed)
+                        preview_col3.metric("After Save", quantity_after_preview)
+                        if return_quantity is not None and return_quantity_preview > maximum_allowed:
+                            st.warning(
+                                f"Only {maximum_allowed} unit(s) are allowed for this action."
+                            )
                         submit_label = "Receive Customer Return" if is_customer_return else "Record Damage and Remove Stock"
-                        save_return = st.form_submit_button(submit_label, type="primary", width="stretch")
+                        save_return = st.button(
+                            submit_label,
+                            type="primary",
+                            width="stretch",
+                            disabled=not quantity_is_valid or not return_reason.strip(),
+                            key=f"save_return_{st.session_state.returns_damage_mode}_{location_id}_{item_code}"
+                        )
 
                     if save_return:
                         if not return_reason.strip():
@@ -3177,7 +3420,8 @@ def render(menu):
                             try:
                                 result = record_return_stock(
                                     conn, st.session_state.username, get_current_role(), location_id,
-                                    item_code, return_quantity, return_reason, condition_status
+                                    item_code, return_quantity, return_reason, condition_status,
+                                    selected_return_invoice_id
                                 )
                                 st.success(
                                     f"Stock updated from {result['quantity_before']} to {result['quantity_after']}."
@@ -3353,9 +3597,20 @@ def render(menu):
                         label: location_id for label, location_id in location_options.items()
                         if location_id != source_location_id_preview
                     }
-                    with st.form("create_transfer_form"):
-                        destination_location = st.selectbox("To Location", list(destination_options.keys()))
-                        transfer_quantity = st.number_input("Quantity", min_value=1, step=1)
+                    # Keep transfer controls outside a form so the quantity/status
+                    # preview updates immediately on every change.
+                    with st.container(border=True):
+                        destination_location = st.selectbox(
+                            "To Location", list(destination_options.keys()), key="transfer_destination_location"
+                        )
+                        transfer_quantity = st.number_input(
+                            "Quantity",
+                            min_value=1,
+                            value=None,
+                            step=1,
+                            placeholder="Enter quantity to transfer",
+                            key="transfer_quantity"
+                        )
                         transfer_status = st.selectbox(
                             "Status",
                             ["completed", "pending"],
@@ -3374,19 +3629,45 @@ def render(menu):
                             int(destination_preview_rows.iloc[0]["quantity"])
                             if not destination_preview_rows.empty else 0
                         )
+                        transfer_quantity_preview = int(transfer_quantity or 0)
+                        transfer_available_preview = int(preview_row["transfer_available"])
+                        transfer_quantity_is_valid = (
+                            transfer_quantity is not None
+                            and transfer_quantity_preview > 0
+                            and transfer_quantity_preview <= transfer_available_preview
+                        )
+                        moves_now = transfer_status == "completed"
                         preview_cols = st.columns(4)
                         preview_values = [
                             ("Source Now", int(preview_row["quantity"])),
                             ("Reserved", int(preview_row["pending_quantity"])),
-                            ("Source After", max(int(preview_row["quantity"])-int(transfer_quantity),0)),
-                            ("Destination After", destination_before_preview+int(transfer_quantity)),
+                            (
+                                "Source After",
+                                max(int(preview_row["quantity"]) - transfer_quantity_preview, 0)
+                                if moves_now else int(preview_row["quantity"])
+                            ),
+                            (
+                                "Destination After",
+                                destination_before_preview + transfer_quantity_preview
+                                if moves_now else destination_before_preview
+                            ),
                         ]
                         for preview_col, (preview_label, preview_value) in zip(preview_cols, preview_values):
                             with preview_col:
                                 st.metric(preview_label, preview_value)
                         if transfer_status == "pending":
                             st.info("Pending reserves the quantity but does not change either location until completed.")
-                        save_transfer = st.form_submit_button("Save Transfer", type="primary", width="stretch")
+                        if transfer_quantity is not None and transfer_quantity_preview > transfer_available_preview:
+                            st.warning(
+                                f"Only {transfer_available_preview} unit(s) are available to transfer."
+                            )
+                        save_transfer = st.button(
+                            "Save Transfer",
+                            type="primary",
+                            width="stretch",
+                            disabled=not transfer_quantity_is_valid,
+                            key="save_inventory_transfer"
+                        )
 
                 if save_transfer:
                     if source_location == destination_location:

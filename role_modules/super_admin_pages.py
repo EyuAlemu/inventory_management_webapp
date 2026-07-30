@@ -1,4 +1,5 @@
 from datetime import datetime
+import math
 
 
 def calculate_new_base_quantity(current_quantity, quantity_to_add):
@@ -23,10 +24,16 @@ def create_inventory_entry(
         raise ValueError("Quantity must be greater than zero.")
     cost = float(cost)
     selling_price = float(selling_price)
-    if cost < 0:
-        raise ValueError("Unit Purchase Cost cannot be negative.")
+    if not math.isfinite(cost) or cost <= 0:
+        raise ValueError("Unit Purchase Cost is required and must be greater than zero.")
+    if not math.isfinite(selling_price):
+        raise ValueError("Location Selling Price must be a valid number.")
     if selling_price < 0:
         raise ValueError("Selling Price cannot be negative.")
+    if selling_price > 0 and selling_price < cost:
+        raise ValueError("Location Selling Price cannot be lower than Unit Purchase Cost.")
+    cost = round(cost, 2)
+    selling_price = round(selling_price, 2)
 
     cursor = conn.cursor()
     try:
@@ -285,7 +292,7 @@ def render(menu):
                     )
                     inventory_cost = st.number_input(
                         "Unit Purchase Cost",
-                        min_value=0.0,
+                        min_value=0.01,
                         value=None,
                         step=0.01,
                         format="%.2f",
@@ -293,18 +300,36 @@ def render(menu):
                     )
                     selling_price = st.number_input(
                         "Location Selling Price (Optional)",
-                        min_value=0.0,
+                        min_value=0.01,
                         value=None,
                         step=0.01,
                         format="%.2f",
                         placeholder="Enter selling price"
                     )
+                    purchase_cost_valid = inventory_cost is not None and float(inventory_cost) > 0
+                    selling_price_valid = (
+                        selling_price is None
+                        or (
+                            float(selling_price) > 0
+                            and purchase_cost_valid
+                            and float(selling_price) >= float(inventory_cost)
+                        )
+                    )
+                    if inventory_cost is None:
+                        st.caption("Unit Purchase Cost is required.")
+                    if selling_price is not None and purchase_cost_valid and float(selling_price) < float(inventory_cost):
+                        st.error("Location Selling Price cannot be lower than Unit Purchase Cost.")
 
                     save_inventory = st.button(
                         "Save Inventory Entry",
                         type="primary",
                         width="stretch",
-                        disabled=existing_locations_df.empty or quantity is None,
+                        disabled=(
+                            existing_locations_df.empty
+                            or quantity is None
+                            or not purchase_cost_valid
+                            or not selling_price_valid
+                        ),
                         key="save_inventory_entry"
                     )
 
@@ -380,7 +405,7 @@ def render(menu):
                             item_name,
                             description,
                             quantity,
-                            inventory_cost or 0,
+                            inventory_cost,
                             selected_existing_location_id,
                             st.session_state.username,
                             selling_price or 0
@@ -1783,6 +1808,25 @@ def render(menu):
                 unsafe_allow_html=True
             )
 
+            if st.session_state.get("user_management_mode") not in {"create", "assign", "view"}:
+                st.session_state.user_management_mode = "create"
+            user_nav_cols = st.columns(3)
+            user_nav_items = [
+                ("Create User", "create"),
+                ("Assign Access", "assign"),
+                ("View Users", "view"),
+            ]
+            for nav_col, (nav_label, nav_mode) in zip(user_nav_cols, user_nav_items):
+                with nav_col:
+                    if st.button(
+                        nav_label,
+                        type="primary" if st.session_state.user_management_mode == nav_mode else "secondary",
+                        width="stretch",
+                        key=f"user_management_nav_{nav_mode}"
+                    ):
+                        st.session_state.user_management_mode = nav_mode
+                        st.rerun()
+
             total_users = len(users_df)
             super_admin_count = int((users_df["role"] == "super_admin").sum()) if not users_df.empty else 0
             admin_count = int((users_df["role"] == "admin").sum()) if not users_df.empty else 0
@@ -1827,9 +1871,10 @@ def render(menu):
                     unsafe_allow_html=True
                 )
 
-            create_col, manage_col = st.columns([0.95, 1.05])
+            create_col = st.empty()
+            manage_col = st.empty()
 
-            with create_col:
+            with create_col.container():
                 st.markdown('<div class="dashboard-section-title">Create User</div>', unsafe_allow_html=True)
 
                 with st.form("create_user_form"):
@@ -1874,7 +1919,7 @@ def render(menu):
                         finally:
                             conn.close()
 
-            with manage_col:
+            with manage_col.container():
                 st.markdown('<div class="dashboard-section-title">Existing Users</div>', unsafe_allow_html=True)
 
                 if users_df.empty:
@@ -1923,6 +1968,15 @@ def render(menu):
                             finally:
                                 conn.close()
 
+            if st.session_state.user_management_mode == "create":
+                manage_col.empty()
+                return
+            if st.session_state.user_management_mode == "view":
+                create_col.empty()
+                return
+
+            create_col.empty()
+            manage_col.empty()
             conn = get_connection()
             inventory_df = pd.read_sql_query(
                 "SELECT item_code, item_name, quantity FROM inventory ORDER BY item_name",
@@ -1973,7 +2027,7 @@ def render(menu):
             conn.close()
 
             st.markdown("---")
-            st.markdown('<div class="dashboard-section-title">Assign Inventory Products</div>', unsafe_allow_html=True)
+            st.markdown('<div class="dashboard-section-title">Assign Product Access and Quantity</div>', unsafe_allow_html=True)
 
             assignable_product_users_df = users_df[users_df["role"].isin(["admin", "sales"])].copy()
 

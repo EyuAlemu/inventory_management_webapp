@@ -247,6 +247,8 @@ def init_db():
         c.execute("ALTER TABLE returns ADD COLUMN quantity_after INTEGER")
     if "inventory_action" not in return_columns:
         c.execute("ALTER TABLE returns ADD COLUMN inventory_action TEXT")
+    if "invoice_id" not in return_columns:
+        c.execute("ALTER TABLE returns ADD COLUMN invoice_id INTEGER")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS inventory_transfers (
