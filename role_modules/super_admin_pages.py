@@ -219,6 +219,14 @@ def render(menu):
     if has_admin_access():
 
         if menu == "Add Inventory":
+            if "inventory_entry_reset_counter" not in st.session_state:
+                st.session_state.inventory_entry_reset_counter = 0
+            inventory_entry_key = st.session_state.inventory_entry_reset_counter
+            if "inventory_entry_message" in st.session_state:
+                st.success(st.session_state.pop("inventory_entry_message"))
+            if "inventory_entry_qr_path" in st.session_state:
+                saved_qr_path, saved_qr_code = st.session_state.pop("inventory_entry_qr_path")
+                st.image(saved_qr_path, caption=f"QR Code: {saved_qr_code}", width=180)
             conn = get_connection()
             existing_locations_df = pd.read_sql_query(
                 "SELECT id, name, address FROM locations WHERE active=1 ORDER BY name",
@@ -258,7 +266,7 @@ def render(menu):
                         "Select Location Name",
                         location_options,
                         help="Select an existing location for this inventory entry.",
-                        key="inventory_entry_location_selector"
+                        key=f"inventory_entry_location_selector_{inventory_entry_key}"
                     )
                     selected_existing_location_id = int(
                         selected_location_option.rsplit("ID ", 1)[1].rstrip(")")
@@ -276,19 +284,20 @@ def render(menu):
                         "Address / Notes",
                         value=location_address,
                         disabled=True,
-                        key=f"inventory_location_address_{selected_existing_location_id}"
+                        key=f"inventory_location_address_{inventory_entry_key}_{selected_existing_location_id}"
                     )
 
                 with st.container(border=True):
-                    item_code = st.text_input("Item Code", key="admin_item_code")
-                    item_name = st.text_input("Item Name")
-                    description = st.text_area("Description")
+                    item_code = st.text_input("Item Code", key=f"admin_item_code_{inventory_entry_key}")
+                    item_name = st.text_input("Item Name", key=f"admin_item_name_{inventory_entry_key}")
+                    description = st.text_area("Description", key=f"admin_item_description_{inventory_entry_key}")
                     quantity = st.number_input(
                         "Quantity",
                         min_value=1,
                         value=None,
                         step=1,
-                        placeholder="Enter starting quantity"
+                        placeholder="Enter starting quantity",
+                        key=f"admin_item_quantity_{inventory_entry_key}",
                     )
                     inventory_cost = st.number_input(
                         "Unit Purchase Cost",
@@ -296,7 +305,8 @@ def render(menu):
                         value=None,
                         step=0.01,
                         format="%.2f",
-                        placeholder="Enter cost per unit"
+                        placeholder="Enter cost per unit",
+                        key=f"admin_item_cost_{inventory_entry_key}",
                     )
                     selling_price = st.number_input(
                         "Location Selling Price (Optional)",
@@ -304,7 +314,8 @@ def render(menu):
                         value=None,
                         step=0.01,
                         format="%.2f",
-                        placeholder="Enter selling price"
+                        placeholder="Enter selling price",
+                        key=f"admin_item_selling_price_{inventory_entry_key}",
                     )
                     purchase_cost_valid = inventory_cost is not None and float(inventory_cost) > 0
                     selling_price_valid = (
@@ -330,7 +341,7 @@ def render(menu):
                             or not purchase_cost_valid
                             or not selling_price_valid
                         ),
-                        key="save_inventory_entry"
+                        key=f"save_inventory_entry_{inventory_entry_key}"
                     )
 
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -411,7 +422,7 @@ def render(menu):
                             selling_price or 0
                         )
 
-                        st.success(
+                        inventory_saved_message = (
                             f"Inventory entry created successfully with {int(quantity)} unit(s) in {location_name}. "
                             + (
                                 f"Selling price was saved as ${float(selling_price):,.2f}."
@@ -420,11 +431,17 @@ def render(menu):
                         )
                         try:
                             qr_path = generate_qr(item_code.strip())
-                            st.image(qr_path, caption=f"QR Code: {item_code.strip()}", width=180)
+                            st.session_state.inventory_entry_qr_path = (
+                                qr_path,
+                                item_code.strip(),
+                            )
                         except Exception as qr_error:
                             st.warning(
                                 f"Inventory was saved, but its QR code could not be generated: {qr_error}"
                             )
+                        st.session_state.inventory_entry_message = inventory_saved_message
+                        st.session_state.inventory_entry_reset_counter += 1
+                        st.rerun()
 
                     except sqlite3.IntegrityError:
                         conn.rollback()
@@ -1986,12 +2003,22 @@ def render(menu):
                 '''
                 SELECT ps.id, ps.username, u.role, i.item_code, i.item_name,
                        COALESCE(SUM(apa.quantity), 0) AS assigned_quantity,
-                       MAX(COALESCE((
-                           SELECT SUM(als.quantity)
-                           FROM admin_location_stock als
-                           WHERE LOWER(als.username)=LOWER(ps.username)
-                             AND LOWER(als.item_code)=LOWER(ps.item_code)
-                       ), 0), 0) AS added_quantity
+                       CASE
+                           WHEN LOWER(COALESCE(u.role,''))='user' THEN
+                               MAX(COALESCE((
+                                   SELECT SUM(ui.quantity)
+                                   FROM user_inventory ui
+                                   WHERE LOWER(ui.username)=LOWER(ps.username)
+                                     AND LOWER(ui.item_code)=LOWER(ps.item_code)
+                               ), 0), 0)
+                           ELSE
+                               MAX(COALESCE((
+                                   SELECT SUM(als.quantity)
+                                   FROM admin_location_stock als
+                                   WHERE LOWER(als.username)=LOWER(ps.username)
+                                     AND LOWER(als.item_code)=LOWER(ps.item_code)
+                               ), 0), 0)
+                       END AS added_quantity
                 FROM product_suppliers ps
                 LEFT JOIN users u ON ps.username = u.username
                 LEFT JOIN inventory i ON ps.item_code = i.item_code
@@ -2029,16 +2056,18 @@ def render(menu):
             st.markdown("---")
             st.markdown('<div class="dashboard-section-title">Assign Product Access and Quantity</div>', unsafe_allow_html=True)
 
-            assignable_product_users_df = users_df[users_df["role"].isin(["admin", "sales"])].copy()
+            assignable_product_users_df = users_df[
+                users_df["role"].isin(["admin", "sales", "user"])
+            ].copy()
 
             if assignable_product_users_df.empty or inventory_df.empty:
-                st.info("Create at least one admin or sales account and one inventory item before assigning products.")
+                st.info("Create at least one Admin, Sales, or Standard User account and one inventory item before assigning products.")
             else:
                 supplier_col, supplier_table_col = st.columns([0.9, 1.1])
 
                 with supplier_col:
                     supplier_username = st.selectbox(
-                        "Admin or Sales User",
+                        "Admin, Sales, or Standard User",
                         assignable_product_users_df["username"].tolist(),
                         key="supplier_assignment_user"
                     )
@@ -2084,20 +2113,20 @@ def render(menu):
                         and pd.notna(current_supplier_assignment_rows.iloc[0]["assigned_quantity"])
                         else 0
                     )
-                    total_item_assigned_to_admins = 0
+                    total_item_assigned_to_users = 0
                     if not product_assignments_df.empty:
-                        item_admin_assignment_rows = product_assignments_df[
-                            (product_assignments_df["role"] == "admin")
+                        item_assignment_rows = product_assignments_df[
+                            product_assignments_df["role"].isin(["admin", "sales", "user"])
                             & (
                                 product_assignments_df["item_code"].astype(str).str.lower()
                                 == selected_supplier_item_code.lower()
                             )
                         ]
-                        total_item_assigned_to_admins = int(
-                            item_admin_assignment_rows["assigned_quantity"].fillna(0).sum()
+                        total_item_assigned_to_users = int(
+                            item_assignment_rows["assigned_quantity"].fillna(0).sum()
                         )
                     assigned_product_quantity = 0
-                    if selected_supplier_user_role == "admin":
+                    if selected_supplier_user_role in {"admin", "sales", "user"}:
                         if "supplier_assignment_reset_counter" not in st.session_state:
                             st.session_state.supplier_assignment_reset_counter = 0
                         supplier_assignment_quantity_key = (
@@ -2106,23 +2135,29 @@ def render(menu):
                         )
                         available_supplier_assignment_quantity = max(
                             selected_supplier_item_quantity
-                            - total_item_assigned_to_admins,
+                            - total_item_assigned_to_users,
                             0
                         )
                         assigned_product_quantity = st.number_input(
                             "Quantity To Assign",
                             min_value=0,
                             step=1,
-                            value=0,
-                            help="Adds quantity to this admin's existing assigned quantity.",
+                            value=None,
+                            placeholder="Enter quantity",
+                            help=(
+                                "Adds quantity to this user's existing reservation. "
+                                "The total assigned to Admin, Sales, and Standard Users cannot exceed the item base quantity."
+                            ),
                             key=supplier_assignment_quantity_key
                         )
                         st.caption(
-                            f"Current admin assigned quantity: {current_supplier_assigned_quantity}. "
-                            f"Assigned to all admins: {total_item_assigned_to_admins}. "
+                            f"Current {selected_supplier_user_role.replace('_', ' ').title()} assigned quantity: "
+                            f"{current_supplier_assigned_quantity}. "
+                            f"Assigned to all Admin, Sales, and Standard Users: {total_item_assigned_to_users}. "
                             f"Item base quantity: {selected_supplier_item_quantity}. "
                             f"Available to assign: {available_supplier_assignment_quantity}. "
-                            f"After save, this admin will have {current_supplier_assigned_quantity + int(assigned_product_quantity)}."
+                            f"After save, this user will have "
+                            f"{current_supplier_assigned_quantity + int(assigned_product_quantity or 0)}."
                         )
 
                     supplier_assign_col, supplier_remove_col = st.columns(2)
@@ -2134,7 +2169,7 @@ def render(menu):
 
                             try:
                                 c.execute("BEGIN IMMEDIATE")
-                                if selected_supplier_user_role == "admin":
+                                if selected_supplier_user_role in {"admin", "sales", "user"}:
                                     quantity_to_assign = int(
                                         st.session_state.get(
                                             supplier_assignment_quantity_key,
@@ -2171,7 +2206,7 @@ def render(menu):
                                         ''',
                                         (selected_supplier_item_code, supplier_username)
                                     )
-                                    assigned_to_other_admins = int(c.fetchone()[0] or 0)
+                                    assigned_to_other_users = int(c.fetchone()[0] or 0)
                                     c.execute(
                                         "SELECT COALESCE(quantity,0) FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                                         (selected_supplier_item_code,)
@@ -2182,7 +2217,7 @@ def render(menu):
                                     locked_item_base_quantity = int(locked_item_row[0] or 0)
                                     max_quantity_to_add = max(
                                         locked_item_base_quantity
-                                        - assigned_to_other_admins
+                                        - assigned_to_other_users
                                         - existing_assigned_quantity,
                                         0
                                     )
@@ -2190,8 +2225,8 @@ def render(menu):
                                         st.error(
                                             "Quantity To Assign is greater than the remaining assignable quantity. "
                                             f"Item base quantity: {locked_item_base_quantity}; "
-                                            f"this admin already has: {existing_assigned_quantity}; "
-                                            f"other admins have: {assigned_to_other_admins}; "
+                                            f"this user already has: {existing_assigned_quantity}; "
+                                            f"other assigned users have: {assigned_to_other_users}; "
                                             f"available to assign now: {max_quantity_to_add}."
                                         )
                                         conn.rollback()
@@ -2204,7 +2239,7 @@ def render(menu):
                                     ''',
                                     (supplier_username, selected_supplier_item_code)
                                 )
-                                if selected_supplier_user_role == "admin":
+                                if selected_supplier_user_role in {"admin", "sales", "user"}:
                                     c.execute(
                                         '''
                                         DELETE FROM admin_product_allocations
@@ -2224,8 +2259,8 @@ def render(menu):
                                         )
                                     )
                                 conn.commit()
-                                st.success("Product assignment saved for the selected admin or sales user.")
-                                if selected_supplier_user_role == "admin":
+                                st.success("Product access and quantity assignment saved for the selected user.")
+                                if selected_supplier_user_role in {"admin", "sales", "user"}:
                                     st.session_state.supplier_assignment_reset_counter += 1
                                 st.rerun()
                             except sqlite3.IntegrityError:
@@ -2247,15 +2282,22 @@ def render(menu):
                             c = conn.cursor()
                             try:
                                 c.execute("BEGIN IMMEDIATE")
-                                c.execute(
-                                    '''SELECT COALESCE(SUM(quantity), 0) FROM admin_location_stock
-                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
-                                    (supplier_username, supplier_item_options[supplier_item])
-                                )
+                                if selected_supplier_user_role == "user":
+                                    c.execute(
+                                        '''SELECT COALESCE(SUM(quantity), 0) FROM user_inventory
+                                           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                        (supplier_username, supplier_item_options[supplier_item])
+                                    )
+                                else:
+                                    c.execute(
+                                        '''SELECT COALESCE(SUM(quantity), 0) FROM admin_location_stock
+                                           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                        (supplier_username, supplier_item_options[supplier_item])
+                                    )
                                 used_assignment_quantity = int(c.fetchone()[0] or 0)
                                 if used_assignment_quantity > 0:
                                     raise ValueError(
-                                        "This product assignment cannot be removed while the admin still has "
+                                        "This product assignment cannot be removed while the user still has "
                                         f"{used_assignment_quantity} unit(s) added from it."
                                     )
                                 c.execute(
@@ -2279,7 +2321,7 @@ def render(menu):
 
                 with supplier_table_col:
                     if product_assignments_df.empty:
-                        st.info("No product assignments exist yet. Assign products to admins or sales users to scope product access.")
+                        st.info("No product assignments exist yet. Assign products to Admin, Sales, or Standard Users to scope product access.")
                     else:
                         st.dataframe(
                             product_assignments_df,
@@ -2292,7 +2334,7 @@ def render(menu):
                                 "item_code": "Item Code",
                                 "item_name": "Item Name",
                                 "assigned_quantity": "Assigned Quantity",
-                                "added_quantity": "Added By Admin",
+                                "added_quantity": "Placed By User",
                                 "remaining_quantity": "Remaining Assignment",
                                 "assignment_status": "Assignment Status",
                             }

@@ -1,3 +1,43 @@
+from role_modules.sales_pages import calculate_sales_receive_capacity, validate_sales_sale_access
+
+
+def calculate_user_receive_capacity(assigned_quantity, received_quantity, company_available_quantity):
+    """Limit a Standard User receipt by their reservation and available company stock."""
+    remaining_assignment = max(
+        int(assigned_quantity or 0) - int(received_quantity or 0),
+        0,
+    )
+    return min(remaining_assignment, max(int(company_available_quantity or 0), 0))
+
+
+def validate_user_sale_access(cursor, username, item_code):
+    """Confirm a Standard User still has product access and personally held stock."""
+    cursor.execute(
+        '''SELECT 1
+           FROM users u
+           JOIN product_suppliers ps ON LOWER(ps.username)=LOWER(u.username)
+           WHERE LOWER(u.username)=LOWER(?) AND LOWER(u.role)='user'
+             AND LOWER(ps.item_code)=LOWER(?)
+           LIMIT 1''',
+        (username, item_code),
+    )
+    if cursor.fetchone() is None:
+        raise ValueError(
+            "This product is not assigned to your account. Choose a product assigned by Super Admin."
+        )
+
+    cursor.execute(
+        '''SELECT COALESCE(quantity,0) FROM user_inventory
+           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+        (username, item_code),
+    )
+    owned_row = cursor.fetchone()
+    owned_quantity = int(owned_row[0] or 0) if owned_row else 0
+    if owned_quantity <= 0:
+        raise ValueError("You do not have any personal quantity of this item available to sell.")
+    return owned_quantity
+
+
 def configure(context):
     globals().update(
         {
@@ -274,6 +314,12 @@ def render(menu):
 
     if menu == "Scan Inventory":
 
+        if st.session_state.pop("scan_reset_receive_quantity", False):
+            st.session_state.pop("scan_transfer_quantity", None)
+        if st.session_state.pop("scan_reset_user_actions", False):
+            st.session_state.pop("return_leftover_quantity", None)
+            st.session_state.pop("take_out_quantity", None)
+
         if "scan_inventory_message" in st.session_state:
             st.success(st.session_state.scan_inventory_message)
             del st.session_state.scan_inventory_message
@@ -307,7 +353,7 @@ def render(menu):
                 manual_locations_df["id"].isin(assigned_location_ids)
             ].copy()
 
-        if supplied_item_codes:
+        if get_current_role() in {"sales", "user"}:
             manual_inventory_df = manual_inventory_df[
                 manual_inventory_df["item_code"].isin(supplied_item_codes)
             ].copy()
@@ -340,10 +386,16 @@ def render(menu):
                     f"{row['name']} - {row['address'] or 'No address'}": int(row["id"])
                     for _, row in manual_locations_df.iterrows()
                 }
-                item_options = {
-                    f"{row['item_name']} ({row['item_code']}) - {int(row['quantity'])} available": row["item_code"]
-                    for _, row in manual_inventory_df.iterrows()
-                }
+                if get_current_role() == "sales":
+                    item_options = {
+                        f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                        for _, row in manual_inventory_df.iterrows()
+                    }
+                else:
+                    item_options = {
+                        f"{row['item_name']} ({row['item_code']})": row["item_code"]
+                        for _, row in manual_inventory_df.iterrows()
+                    }
 
                 with st.form("scan_inventory_lookup_form"):
                     selected_manual_location = st.selectbox(
@@ -374,11 +426,19 @@ def render(menu):
 
             item_code = st.session_state.get("scan_selected_item_code", "").strip()
             selected_location_id = st.session_state.get("scan_selected_location_id")
-            allowed_manual_item_codes = set(manual_inventory_df["item_code"].astype(str).tolist())
-            if item_code and item_code not in allowed_manual_item_codes:
-                st.session_state.pop("scan_selected_item_code", None)
-                item_code = ""
-                st.warning("That item is not available for this account. Choose an item from the available-item dropdown.")
+            allowed_manual_item_codes = {
+                str(code).lower(): str(code)
+                for code in manual_inventory_df["item_code"].astype(str).tolist()
+            }
+            if item_code:
+                canonical_item_code = allowed_manual_item_codes.get(item_code.lower())
+                if canonical_item_code is None:
+                    st.session_state.pop("scan_selected_item_code", None)
+                    item_code = ""
+                    st.warning("That item is not available for this account. Choose an item from the available-item dropdown.")
+                else:
+                    item_code = canonical_item_code
+                    st.session_state.scan_selected_item_code = canonical_item_code
 
         with detail_col:
             st.markdown('<div class="dashboard-section-title">Receive Stock</div>', unsafe_allow_html=True)
@@ -392,7 +452,7 @@ def render(menu):
             c = conn.cursor()
 
             c.execute(
-                "SELECT * FROM inventory WHERE item_code=?",
+                "SELECT * FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                 (item_code,)
             )
 
@@ -400,8 +460,6 @@ def render(menu):
 
             if item:
 
-                status_class = "low" if item[4] <= 5 else "ok"
-                status_text = "Low stock" if item[4] <= 5 else "In stock"
                 item_name_safe = safe_html(item[2])
                 item_description_safe = safe_html(item[3])
                 c.execute(
@@ -423,10 +481,90 @@ def render(menu):
                 location_inventory_row = c.fetchone()
                 location_quantity = int(location_inventory_row[0]) if location_inventory_row else 0
                 receiving_sales_stock = get_current_role() == "sales"
-                account_quantity = location_quantity if receiving_sales_stock else user_quantity
+                receiving_standard_user_stock = get_current_role() == "user"
+                sales_assigned_quantity = 0
+                sales_total_received_quantity = 0
+                sales_location_quantity = 0
+                if receiving_sales_stock:
+                    c.execute(
+                        '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
+                           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                        (st.session_state.username, item_code)
+                    )
+                    sales_assignment_row = c.fetchone()
+                    sales_assigned_quantity = int(sales_assignment_row[0] or 0) if sales_assignment_row else 0
+                    c.execute(
+                        '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                        (st.session_state.username, item_code)
+                    )
+                    sales_total_received_quantity = int(c.fetchone()[0] or 0)
+                    c.execute(
+                        '''SELECT COALESCE(quantity,0) FROM admin_location_stock
+                           WHERE LOWER(username)=LOWER(?) AND location_id=?
+                             AND LOWER(item_code)=LOWER(?)''',
+                        (st.session_state.username, selected_location_id, item_code)
+                    )
+                    sales_location_row = c.fetchone()
+                    sales_location_quantity = int(sales_location_row[0] or 0) if sales_location_row else 0
+                    c.execute(
+                        '''SELECT COALESCE(SUM(quantity),0) FROM location_inventory
+                           WHERE LOWER(item_code)=LOWER(?)''',
+                        (item_code,)
+                    )
+                    total_physical_quantity = int(c.fetchone()[0] or 0)
+                    c.execute(
+                        '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                           WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                        (selected_location_id, item_code)
+                    )
+                    selected_location_owned_quantity = int(c.fetchone()[0] or 0)
+                else:
+                    total_physical_quantity = 0
+                    selected_location_owned_quantity = 0
+                user_assigned_quantity = 0
+                if receiving_standard_user_stock:
+                    c.execute(
+                        '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
+                           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                        (st.session_state.username, item_code)
+                    )
+                    user_assignment_row = c.fetchone()
+                    user_assigned_quantity = (
+                        int(user_assignment_row[0] or 0) if user_assignment_row else 0
+                    )
+                user_available_to_receive = calculate_user_receive_capacity(
+                    user_assigned_quantity,
+                    user_quantity,
+                    int(item[4]),
+                )
+                sales_available_to_receive = calculate_sales_receive_capacity(
+                    sales_assigned_quantity,
+                    sales_total_received_quantity,
+                    int(item[4]),
+                    total_physical_quantity,
+                    location_quantity,
+                    selected_location_owned_quantity,
+                )
+                account_quantity = sales_location_quantity if receiving_sales_stock else user_quantity
                 account_label = "Location Qty" if receiving_sales_stock else "My Current Qty"
+                visible_status_quantity = (
+                    sales_available_to_receive
+                    if receiving_sales_stock else user_available_to_receive
+                )
+                status_class = "low" if visible_status_quantity <= 5 else "ok"
+                status_text = "Low availability" if visible_status_quantity <= 5 else "Ready"
 
                 with detail_col:
+                    quantity_label = (
+                        "ASSIGNED TO YOU"
+                        if receiving_sales_stock or receiving_standard_user_stock
+                        else "MY CURRENT QUANTITY"
+                    )
+                    quantity_value = (
+                        sales_assigned_quantity
+                        if receiving_sales_stock else user_assigned_quantity
+                    )
                     st.markdown(
                         f"""
                         <div class="item-card">
@@ -434,8 +572,8 @@ def render(menu):
                             <div class="item-name">{item_name_safe}</div>
                             <div class="item-meta">{item_description_safe}</div>
                             <div class="quantity-pill">
-                                <div class="quantity-pill-label">SYSTEM AVAILABLE QUANTITY</div>
-                                <div class="quantity-pill-value">{item[4]}</div>
+                                <div class="quantity-pill-label">{quantity_label}</div>
+                                <div class="quantity-pill-value">{quantity_value}</div>
                             </div>
                         </div>
                         """,
@@ -445,51 +583,159 @@ def render(menu):
                     transfer_qty = st.number_input(
                         "Quantity to Receive",
                         min_value=1,
+                        value=None,
                         step=1,
+                        placeholder="Enter quantity",
                         key="scan_transfer_quantity"
                     )
 
-                    account_after_preview = account_quantity + int(transfer_qty)
-                    system_after_preview = max(int(item[4]) - int(transfer_qty), 0)
+                    transfer_qty_preview = int(transfer_qty or 0)
+                    account_after_preview = account_quantity + transfer_qty_preview
 
-                    st.markdown(
-                        f"""
-                        <div class="content-panel">
-                            <div class="workflow-kicker">Stock Preview</div>
-                            <div class="action-summary-grid">
-                                <div class="action-summary-card">
-                                    <div class="action-summary-label">{account_label}</div>
-                                    <div class="action-summary-value">{account_quantity}</div>
-                                </div>
-                                <div class="action-summary-card">
-                                    <div class="action-summary-label">Adding</div>
-                                    <div class="action-summary-value">{int(transfer_qty)}</div>
-                                </div>
-                                <div class="action-summary-card">
-                                    <div class="action-summary-label">{account_label} After</div>
-                                    <div class="action-summary-value">{account_after_preview}</div>
-                                </div>
-                                <div class="action-summary-card">
-                                    <div class="action-summary-label">System Qty After</div>
-                                    <div class="action-summary-value">{system_after_preview}</div>
-                                </div>
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
+                    if receiving_sales_stock:
+                        preview_cards = (
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Your Location Qty</div>'
+                            f'<div class="action-summary-value">{account_quantity}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Available To Receive</div>'
+                            f'<div class="action-summary-value">{sales_available_to_receive}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Receiving</div>'
+                            f'<div class="action-summary-value">{transfer_qty_preview}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Your Location Qty After</div>'
+                            f'<div class="action-summary-value">{account_after_preview}</div>'
+                            '</div>'
+                        )
+                    else:
+                        preview_cards = (
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Assigned To You</div>'
+                            f'<div class="action-summary-value">{user_assigned_quantity}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            f'<div class="action-summary-label">{account_label}</div>'
+                            f'<div class="action-summary-value">{account_quantity}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Available To Receive</div>'
+                            f'<div class="action-summary-value">{user_available_to_receive}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            '<div class="action-summary-label">Receiving</div>'
+                            f'<div class="action-summary-value">{transfer_qty_preview}</div>'
+                            '</div>'
+                            '<div class="action-summary-card">'
+                            f'<div class="action-summary-label">{account_label} After</div>'
+                            f'<div class="action-summary-value">{account_after_preview}</div>'
+                            '</div>'
+                        )
+
+                    preview_html = (
+                        '<div class="content-panel">'
+                        '<div class="workflow-kicker">Stock Preview</div>'
+                        '<div class="action-summary-grid">'
+                        f'{preview_cards}'
+                        '</div>'
+                        '</div>'
                     )
+                    st.markdown(preview_html, unsafe_allow_html=True)
 
                     receive_button_label = (
                         "Receive Into Location"
                         if get_current_role() == "sales"
                         else "Add to My Stock"
                     )
-                    if st.button(receive_button_label, type="primary", width="stretch"):
+                    receive_capacity_preview = (
+                        sales_available_to_receive
+                        if receiving_sales_stock else user_available_to_receive
+                    )
+                    receive_quantity_is_valid = (
+                        transfer_qty is not None
+                        and transfer_qty_preview > 0
+                        and transfer_qty_preview <= receive_capacity_preview
+                    )
+                    if transfer_qty is not None and transfer_qty_preview > receive_capacity_preview:
+                        st.warning(
+                            f"You can receive only {receive_capacity_preview} more unit(s) from your assignment."
+                        )
+                    if st.button(
+                        receive_button_label,
+                        type="primary",
+                        width="stretch",
+                        disabled=not receive_quantity_is_valid,
+                    ):
+                        if transfer_qty is None or int(transfer_qty) <= 0:
+                            st.error("Enter a quantity greater than zero before receiving stock.")
+                            st.stop()
                         transfer_conn = get_connection()
                         transfer_c = transfer_conn.cursor()
 
                         try:
                             transfer_c.execute("BEGIN IMMEDIATE")
+                            if get_current_role() == "sales":
+                                try:
+                                    validate_sales_sale_access(
+                                        transfer_c,
+                                        st.session_state.username,
+                                        selected_location_id,
+                                        item_code
+                                    )
+                                except ValueError as access_error:
+                                    transfer_conn.rollback()
+                                    st.error(str(access_error))
+                                    st.stop()
+                                transfer_c.execute(
+                                    '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                locked_assignment_row = transfer_c.fetchone()
+                                locked_assigned_quantity = (
+                                    int(locked_assignment_row[0] or 0)
+                                    if locked_assignment_row else 0
+                                )
+                                transfer_c.execute(
+                                    '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                locked_received_quantity = int(transfer_c.fetchone()[0] or 0)
+                                transfer_c.execute(
+                                    '''SELECT COALESCE(quantity,0) FROM admin_location_stock
+                                       WHERE LOWER(username)=LOWER(?) AND location_id=?
+                                         AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, selected_location_id, item_code)
+                                )
+                                locked_sales_location_row = transfer_c.fetchone()
+                                locked_sales_location_quantity = (
+                                    int(locked_sales_location_row[0] or 0)
+                                    if locked_sales_location_row else 0
+                                )
+                            else:
+                                transfer_c.execute(
+                                    '''SELECT 1 FROM product_suppliers
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                if transfer_c.fetchone() is None:
+                                    transfer_conn.rollback()
+                                    st.error("This product is no longer assigned to your account. Refresh and select an assigned item.")
+                                    st.stop()
+                                transfer_c.execute(
+                                    '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
+                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                                    (st.session_state.username, item_code)
+                                )
+                                locked_user_assignment_row = transfer_c.fetchone()
+                                locked_user_assigned_quantity = (
+                                    int(locked_user_assignment_row[0] or 0)
+                                    if locked_user_assignment_row else 0
+                                )
                             transfer_c.execute(
                                 "SELECT id, quantity FROM inventory WHERE item_code=?",
                                 (item_code,)
@@ -513,6 +759,18 @@ def render(menu):
                                 (selected_location_id, item_code)
                             )
                             current_location_inventory = transfer_c.fetchone()
+                            transfer_c.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM location_inventory
+                                   WHERE LOWER(item_code)=LOWER(?)''',
+                                (item_code,)
+                            )
+                            locked_total_physical_quantity = int(transfer_c.fetchone()[0] or 0)
+                            transfer_c.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                                   WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                                (selected_location_id, item_code)
+                            )
+                            locked_selected_location_owned = int(transfer_c.fetchone()[0] or 0)
 
                             if not selected_location_id:
                                 transfer_conn.rollback()
@@ -525,26 +783,77 @@ def render(menu):
                                 user_quantity_before = int(current_user_inventory[0]) if current_user_inventory else 0
                                 location_quantity_before = int(current_location_inventory[0]) if current_location_inventory else 0
                                 transfer_qty_int = int(transfer_qty)
+                                receiving_sales_stock = get_current_role() == "sales"
+                                if receiving_sales_stock:
+                                    locked_available_to_receive = calculate_sales_receive_capacity(
+                                        locked_assigned_quantity,
+                                        locked_received_quantity,
+                                        system_quantity_before,
+                                        locked_total_physical_quantity,
+                                        location_quantity_before,
+                                        locked_selected_location_owned,
+                                    )
+                                    if transfer_qty_int > locked_available_to_receive:
+                                        transfer_conn.rollback()
+                                        st.error(
+                                            f"You can receive only {locked_available_to_receive} more unit(s). "
+                                            "This limit uses your remaining assignment and company physical capacity."
+                                        )
+                                        st.stop()
 
-                                if transfer_qty_int > system_quantity_before:
-                                    transfer_conn.rollback()
-                                    st.error("Not enough system stock is available to allocate that quantity.")
-                                else:
-                                    system_quantity_after = system_quantity_before - transfer_qty_int
-                                    receiving_sales_stock = get_current_role() == "sales"
+                                if not receiving_sales_stock:
+                                    locked_user_available_to_receive = calculate_user_receive_capacity(
+                                        locked_user_assigned_quantity,
+                                        user_quantity_before,
+                                        system_quantity_before,
+                                    )
+                                    if transfer_qty_int > locked_user_available_to_receive:
+                                        transfer_conn.rollback()
+                                        st.error(
+                                            f"You can receive only {locked_user_available_to_receive} more unit(s). "
+                                            "This limit uses your remaining assigned quantity and current availability."
+                                        )
+                                        st.stop()
+
+                                if transfer_qty_int > 0:
+                                    system_quantity_after = (
+                                        system_quantity_before
+                                        if receiving_sales_stock
+                                        else system_quantity_before - transfer_qty_int
+                                    )
                                     account_quantity_before = (
-                                        location_quantity_before if receiving_sales_stock else user_quantity_before
+                                        locked_sales_location_quantity
+                                        if receiving_sales_stock else user_quantity_before
                                     )
                                     account_quantity_after = account_quantity_before + transfer_qty_int
-
-                                    transfer_c.execute(
-                                        '''
-                                        UPDATE inventory
-                                        SET quantity=?
-                                        WHERE id=?
-                                        ''',
-                                        (system_quantity_after, int(current_inventory[0]))
+                                    ownership_from_existing = (
+                                        min(
+                                            transfer_qty_int,
+                                            max(
+                                                location_quantity_before
+                                                - locked_selected_location_owned,
+                                                0,
+                                            ),
+                                        )
+                                        if receiving_sales_stock else 0
                                     )
+                                    physical_quantity_to_add = (
+                                        transfer_qty_int - ownership_from_existing
+                                        if receiving_sales_stock else 0
+                                    )
+                                    physical_location_quantity_after = (
+                                        location_quantity_before + physical_quantity_to_add
+                                    )
+
+                                    if not receiving_sales_stock:
+                                        transfer_c.execute(
+                                            '''
+                                            UPDATE inventory
+                                            SET quantity=?
+                                            WHERE id=?
+                                            ''',
+                                            (system_quantity_after, int(current_inventory[0]))
+                                        )
 
                                     if receiving_sales_stock:
                                         transfer_c.execute(
@@ -554,7 +863,20 @@ def render(menu):
                                             ON CONFLICT(location_id,item_code)
                                             DO UPDATE SET quantity=excluded.quantity
                                             ''',
-                                            (selected_location_id, item_code, account_quantity_after)
+                                            (selected_location_id, item_code, physical_location_quantity_after)
+                                        )
+                                        transfer_c.execute(
+                                            '''INSERT INTO admin_location_stock
+                                               (username,location_id,item_code,quantity)
+                                               VALUES (?,?,?,?)
+                                               ON CONFLICT(username,location_id,item_code)
+                                               DO UPDATE SET quantity=excluded.quantity''',
+                                            (
+                                                st.session_state.username,
+                                                selected_location_id,
+                                                item_code,
+                                                account_quantity_after
+                                            )
                                         )
                                         transfer_c.execute(
                                             '''
@@ -566,9 +888,13 @@ def render(menu):
                                                 selected_location_id,
                                                 item_code,
                                                 location_quantity_before,
-                                                transfer_qty_int,
-                                                account_quantity_after,
-                                                "Receive",
+                                                physical_quantity_to_add,
+                                                physical_location_quantity_after,
+                                                (
+                                                    "Assign Existing Stock"
+                                                    if physical_quantity_to_add == 0
+                                                    else "Assign / Receive"
+                                                ),
                                                 st.session_state.username,
                                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                             )
@@ -606,12 +932,13 @@ def render(menu):
                                     transfer_conn.commit()
                                     st.session_state.scan_inventory_message = (
                                         f"{transfer_qty_int} unit(s) received into the selected location. "
-                                        f"Location quantity is now {account_quantity_after}; system stock is now {system_quantity_after}."
+                                        f"Location quantity is now {account_quantity_after}."
                                         if receiving_sales_stock
                                         else
                                         f"{transfer_qty_int} unit(s) received. Account quantity is now "
-                                        f"{account_quantity_after}; system stock is now {system_quantity_after}."
+                                        f"{account_quantity_after}."
                                     )
+                                    st.session_state.scan_reset_receive_quantity = True
                                     st.rerun()
 
                         finally:
@@ -634,10 +961,17 @@ def render(menu):
                                     "Return Leftover Quantity",
                                     min_value=1,
                                     max_value=max(user_quantity, 1),
+                                    value=None,
                                     step=1,
+                                    placeholder="Enter quantity to return",
                                     key="return_leftover_quantity"
                                 )
-                                if st.button("Return to Inventory", type="secondary", width="stretch"):
+                                if st.button(
+                                    "Return to Inventory",
+                                    type="secondary",
+                                    width="stretch",
+                                    disabled=return_qty is None,
+                                ):
                                     return_conn = get_connection()
                                     return_c = return_conn.cursor()
 
@@ -703,6 +1037,7 @@ def render(menu):
                                             st.session_state.scan_inventory_message = (
                                                 f"{return_qty_int} unit(s) returned to inventory. Your quantity is now {user_quantity_after}."
                                             )
+                                            st.session_state.scan_reset_user_actions = True
                                             st.rerun()
                                     finally:
                                         return_conn.close()
@@ -712,10 +1047,17 @@ def render(menu):
                                     "Take Out Quantity",
                                     min_value=1,
                                     max_value=max(user_quantity, 1),
+                                    value=None,
                                     step=1,
+                                    placeholder="Enter quantity to take out",
                                     key="take_out_quantity"
                                 )
-                                if st.button("Take Out", type="secondary", width="stretch"):
+                                if st.button(
+                                    "Take Out",
+                                    type="secondary",
+                                    width="stretch",
+                                    disabled=take_out_qty is None,
+                                ):
                                     take_out_conn = get_connection()
                                     take_out_c = take_out_conn.cursor()
 
@@ -768,6 +1110,7 @@ def render(menu):
                                             st.session_state.scan_inventory_message = (
                                                 f"{take_out_qty_int} unit(s) taken out of your account. Your quantity is now {user_quantity_after}."
                                             )
+                                            st.session_state.scan_reset_user_actions = True
                                             st.rerun()
                                     finally:
                                         take_out_conn.close()
@@ -781,6 +1124,9 @@ def render(menu):
 
     if menu == "Sell Item" and get_current_role() != "sales":
 
+        if st.session_state.pop("sell_reset_quantity", False):
+            st.session_state.pop("sell_quantity_sold", None)
+
         if "sell_item_message" in st.session_state:
             st.success(st.session_state.sell_item_message)
             del st.session_state.sell_item_message
@@ -790,74 +1136,119 @@ def render(menu):
             <div class="page-header">
                 <div class="page-eyebrow">User Sale</div>
                 <div class="page-title">Sell Item</div>
-                <p class="page-subtitle">Enter an item code, choose quantity sold, and save the sale with remaining stock.</p>
+                <p class="page-subtitle">Choose one of your assigned items, enter the quantity sold, and review the live stock preview.</p>
             </div>
             """,
             unsafe_allow_html=True
         )
 
+        sale_items_conn = get_connection()
+        try:
+            user_sale_items_df = pd.read_sql_query(
+                '''SELECT i.item_code, i.item_name, COALESCE(ui.quantity,0) AS quantity
+                   FROM user_inventory ui
+                   JOIN inventory i ON LOWER(i.item_code)=LOWER(ui.item_code)
+                   JOIN product_suppliers ps
+                     ON LOWER(ps.username)=LOWER(ui.username)
+                    AND LOWER(ps.item_code)=LOWER(ui.item_code)
+                   WHERE LOWER(ui.username)=LOWER(?) AND COALESCE(ui.quantity,0)>0
+                   ORDER BY i.item_name, i.item_code''',
+                sale_items_conn,
+                params=(st.session_state.username,),
+            )
+        finally:
+            sale_items_conn.close()
+
         sell_lookup_col, sell_detail_col = st.columns([0.9, 1.1])
 
         with sell_lookup_col:
-            if "prefill_sell_item_code" in st.session_state:
-                st.session_state.sell_lookup_code = st.session_state.prefill_sell_item_code
-                st.session_state.sell_selected_item_code = st.session_state.prefill_sell_item_code
-                del st.session_state.prefill_sell_item_code
+            prefill_sell_item_code = st.session_state.pop("prefill_sell_item_code", "")
 
             st.markdown(
                 """
                 <div class="workflow-panel">
                     <div class="workflow-kicker">Step 1</div>
                     <div class="workflow-title">Find Item to Sell</div>
-                    <div class="workflow-text">Enter the item code, then confirm how many units were sold from your available stock.</div>
+                    <div class="workflow-text">Select an item name and code from products currently available in your personal stock.</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            with st.form("sell_item_lookup_form"):
-                sell_lookup_code = st.text_input(
-                    "Item Code",
-                    key="sell_lookup_code",
-                    placeholder="Enter item code, for example 123"
-                )
-                sell_lookup_submitted = st.form_submit_button(
-                    "View Sale Details",
-                    type="primary",
-                    width="stretch"
-                )
-
-            if sell_lookup_submitted:
-                st.session_state.sell_selected_item_code = sell_lookup_code.strip()
-
-            sell_item_code = st.session_state.get("sell_selected_item_code", "").strip()
+            if user_sale_items_df.empty:
+                st.info("No assigned personal stock is currently available to sell.")
+                sell_item_code = ""
+            else:
+                sell_item_search = st.text_input(
+                    "Search Item Name / Item Code",
+                    key="sell_item_search",
+                    placeholder="Type an item name or code",
+                ).strip()
+                filtered_sale_items_df = user_sale_items_df.copy()
+                if sell_item_search:
+                    normalized_search = sell_item_search.lower()
+                    filtered_sale_items_df = filtered_sale_items_df[
+                        filtered_sale_items_df["item_name"].fillna("").astype(str).str.lower().str.contains(
+                            normalized_search, regex=False
+                        )
+                        | filtered_sale_items_df["item_code"].fillna("").astype(str).str.lower().str.contains(
+                            normalized_search, regex=False
+                        )
+                    ].copy()
+                sell_item_options = {
+                    f"{row['item_name']} ({row['item_code']})": str(row["item_code"])
+                    for _, row in filtered_sale_items_df.iterrows()
+                }
+                sell_item_labels = list(sell_item_options)
+                if not sell_item_labels:
+                    st.info("No assigned item matches that name or code.")
+                    sell_item_code = ""
+                else:
+                    selected_index = 0
+                    if prefill_sell_item_code:
+                        for option_index, option_label in enumerate(sell_item_labels):
+                            if sell_item_options[option_label].lower() == str(prefill_sell_item_code).lower():
+                                selected_index = option_index
+                                break
+                    selected_sell_item = st.selectbox(
+                        "Available Item",
+                        sell_item_labels,
+                        index=selected_index,
+                        key="sell_item_dropdown",
+                    )
+                    sell_item_code = sell_item_options[selected_sell_item]
 
         with sell_detail_col:
             st.markdown('<div class="dashboard-section-title">Record Sale</div>', unsafe_allow_html=True)
 
             if not sell_item_code:
-                st.info("Enter an item code on the left to load your available quantity before saving a sale.")
+                st.info("Select an assigned item with available personal stock before saving a sale.")
 
         if sell_item_code:
             conn = get_connection()
             c = conn.cursor()
             c.execute(
-                "SELECT * FROM inventory WHERE item_code=?",
+                "SELECT * FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                 (sell_item_code,)
             )
             item = c.fetchone()
             c.execute(
                 '''
                 SELECT quantity FROM user_inventory
-                WHERE username=? AND item_code=?
+                WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                 ''',
                 (st.session_state.username, sell_item_code)
             )
             user_inventory_row = c.fetchone()
+            c.execute(
+                '''SELECT 1 FROM product_suppliers
+                   WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+                (st.session_state.username, sell_item_code),
+            )
+            has_product_access = c.fetchone() is not None
             conn.close()
 
-            if item:
-                system_quantity = int(item[4])
+            if item and has_product_access:
                 user_quantity = int(user_inventory_row[0]) if user_inventory_row else 0
                 item_name_safe = safe_html(item[2])
                 item_description_safe = safe_html(item[3])
@@ -883,11 +1274,19 @@ def render(menu):
                     quantity_sold = st.number_input(
                         "Quantity Sold",
                         min_value=1,
+                        value=None,
                         step=1,
+                        placeholder="Enter quantity sold",
                         key="sell_quantity_sold"
                     )
 
-                    quantity_after_preview = max(user_quantity - int(quantity_sold), 0)
+                    quantity_sold_preview = int(quantity_sold or 0)
+                    quantity_after_preview = max(user_quantity - quantity_sold_preview, 0)
+                    sale_quantity_is_valid = (
+                        quantity_sold is not None
+                        and quantity_sold_preview > 0
+                        and quantity_sold_preview <= user_quantity
+                    )
 
                     st.markdown(
                         f"""
@@ -895,16 +1294,12 @@ def render(menu):
                             <div class="workflow-kicker">Sale Preview</div>
                             <div class="action-summary-grid">
                                 <div class="action-summary-card">
-                                    <div class="action-summary-label">System Qty</div>
-                                    <div class="action-summary-value">{system_quantity}</div>
-                                </div>
-                                <div class="action-summary-card">
                                     <div class="action-summary-label">My Qty Before</div>
                                     <div class="action-summary-value">{user_quantity}</div>
                                 </div>
                                 <div class="action-summary-card">
                                     <div class="action-summary-label">Sold</div>
-                                    <div class="action-summary-value">{int(quantity_sold)}</div>
+                                    <div class="action-summary-value">{quantity_sold_preview}</div>
                                 </div>
                                 <div class="action-summary-card">
                                     <div class="action-summary-label">My Qty After</div>
@@ -916,23 +1311,43 @@ def render(menu):
                         unsafe_allow_html=True
                     )
 
-                    if st.button("Save Sale", type="primary", width="stretch"):
+                    if quantity_sold is not None and quantity_sold_preview > user_quantity:
+                        st.warning(
+                            f"You can sell only {user_quantity} unit(s) from your personal stock."
+                        )
+
+                    if st.button(
+                        "Save Sale",
+                        type="primary",
+                        width="stretch",
+                        disabled=not sale_quantity_is_valid,
+                    ):
                         sale_conn = get_connection()
                         sale_c = sale_conn.cursor()
 
                         try:
                             sale_c.execute("BEGIN IMMEDIATE")
+                            try:
+                                validate_user_sale_access(
+                                    sale_c,
+                                    st.session_state.username,
+                                    sell_item_code,
+                                )
+                            except ValueError as access_error:
+                                sale_conn.rollback()
+                                st.error(str(access_error))
+                                st.stop()
                             sale_c.execute(
                                 '''
                                 SELECT quantity FROM user_inventory
-                                WHERE username=? AND item_code=?
+                                WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                 ''',
                                 (st.session_state.username, sell_item_code)
                             )
                             current_user_item = sale_c.fetchone()
 
                             sale_c.execute(
-                                "SELECT id, item_name, quantity FROM inventory WHERE item_code=?",
+                                "SELECT id, item_name, quantity FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                                 (sell_item_code,)
                             )
                             current_item = sale_c.fetchone()
@@ -954,7 +1369,7 @@ def render(menu):
                                         '''
                                         UPDATE user_inventory
                                         SET quantity=?
-                                        WHERE username=? AND item_code=?
+                                        WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                         ''',
                                         (quantity_after, st.session_state.username, sell_item_code)
                                     )
@@ -982,11 +1397,15 @@ def render(menu):
                                     st.session_state.sell_item_message = (
                                         f"Sale saved successfully. Sold {quantity_sold_int} unit(s) from your personal stock; remaining quantity is {quantity_after}."
                                     )
+                                    st.session_state.sell_reset_quantity = True
                                     st.rerun()
 
                         finally:
                             sale_conn.close()
 
+            elif item and not has_product_access:
+                with sell_detail_col:
+                    st.error("This product is not assigned to your account. Choose a product assigned by Super Admin.")
             else:
                 with sell_detail_col:
                     st.error("Item not found. Check the item code and try again.")
@@ -1128,20 +1547,20 @@ def render(menu):
                 "take_out": "Taken Out",
                 "legacy": "Legacy Record",
             })
-            display_df = display_df[
-                [
-                    "id",
-                    "username",
-                    "item_code",
-                    "transaction_type",
-                    "source_type",
-                    "quantity_before",
-                    "quantity_used",
-                    "quantity_after",
-                    "verification",
-                    "transaction_time",
-                ]
+            display_columns = [
+                "id",
+                "item_code",
+                "transaction_type",
+                "source_type",
+                "quantity_before",
+                "quantity_used",
+                "quantity_after",
+                "verification",
+                "transaction_time",
             ]
+            if has_admin_access():
+                display_columns.insert(1, "username")
+            display_df = display_df[display_columns]
 
             st.dataframe(
                 display_df,

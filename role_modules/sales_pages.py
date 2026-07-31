@@ -1,6 +1,56 @@
 from role_modules.admin_pages import consume_invoice_location_ownership
 
 
+def calculate_sales_available_assignment(assigned_quantity, placed_quantity):
+    """Return how many more units a Sales user may receive from an assignment."""
+    return max(int(assigned_quantity or 0) - int(placed_quantity or 0), 0)
+
+
+def calculate_sales_receive_capacity(
+    assigned_quantity, placed_quantity, base_quantity, physical_quantity,
+    selected_location_quantity=0, selected_location_owned_quantity=0,
+):
+    """Cap a Sales receipt by reservation plus usable unowned/company capacity."""
+    assignment_available = calculate_sales_available_assignment(assigned_quantity, placed_quantity)
+    unlocated_capacity = max(int(base_quantity or 0) - int(physical_quantity or 0), 0)
+    unowned_at_location = max(
+        int(selected_location_quantity or 0) - int(selected_location_owned_quantity or 0),
+        0,
+    )
+    return min(assignment_available, unowned_at_location + unlocated_capacity)
+
+
+def validate_sales_sale_access(cursor, username, location_id, item_code):
+    """Confirm that a Sales user still has active location and product access."""
+    cursor.execute(
+        '''SELECT 1
+           FROM users u
+           JOIN user_locations ul ON LOWER(ul.username)=LOWER(u.username)
+           JOIN locations l ON l.id=ul.location_id
+           WHERE LOWER(u.username)=LOWER(?) AND LOWER(u.role)='sales'
+             AND ul.location_id=? AND COALESCE(l.active,0)=1
+           LIMIT 1''',
+        (username, location_id)
+    )
+    if cursor.fetchone() is None:
+        raise ValueError(
+            "You no longer have access to this active location. Refresh the page and select an assigned location."
+        )
+
+    cursor.execute(
+        '''SELECT 1 FROM product_suppliers
+           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
+           LIMIT 1''',
+        (username, item_code)
+    )
+    if cursor.fetchone() is None:
+        raise ValueError(
+            "This product is not assigned to your Sales account. Refresh the page and select an assigned product."
+        )
+
+    return True
+
+
 def configure(context):
     globals().update(
         {
@@ -25,14 +75,19 @@ def render(menu):
         sales_stock_df = pd.read_sql_query(
             '''
             SELECT li.location_id, l.name AS location, li.item_code, i.item_name,
-                   li.quantity, COALESCE(lp.price, 0) AS price
+                   MIN(li.quantity, COALESCE(als.quantity,0)) AS quantity,
+                   COALESCE(lp.price, 0) AS price
             FROM location_inventory li
             LEFT JOIN locations l ON li.location_id = l.id
             LEFT JOIN inventory i ON li.item_code = i.item_code
             LEFT JOIN location_prices lp ON lp.location_id = li.location_id AND lp.item_code = li.item_code
-            WHERE li.quantity > 0
+            LEFT JOIN admin_location_stock als
+                ON als.location_id=li.location_id AND LOWER(als.item_code)=LOWER(li.item_code)
+               AND LOWER(als.username)=LOWER(?)
+            WHERE li.quantity > 0 AND COALESCE(als.quantity,0) > 0
             ''',
-            conn
+            conn,
+            params=(st.session_state.username,)
         )
         sales_invoice_df = pd.read_sql_query(
             '''
@@ -54,10 +109,9 @@ def render(menu):
         sales_stock_df = sales_stock_df[
             sales_stock_df["location_id"].isin(assigned_location_ids)
         ].copy()
-        if supplied_item_codes:
-            sales_stock_df = sales_stock_df[
-                sales_stock_df["item_code"].isin(supplied_item_codes)
-            ].copy()
+        sales_stock_df = sales_stock_df[
+            sales_stock_df["item_code"].isin(supplied_item_codes)
+        ].copy()
         sales_stock_df = sales_stock_df[sales_stock_df["price"] > 0].copy()
         sales_invoice_df = sales_invoice_df[
             sales_invoice_df["location_id"].isin(assigned_location_ids)
@@ -188,6 +242,9 @@ def render(menu):
 
 
     if menu == "Sell Item" and get_current_role() == "sales":
+        if "sales_sale_form_reset_counter" not in st.session_state:
+            st.session_state.sales_sale_form_reset_counter = 0
+        sales_form_key = st.session_state.sales_sale_form_reset_counter
         if "sales_invoice_message" in st.session_state:
             st.success(st.session_state.sales_invoice_message)
             del st.session_state.sales_invoice_message
@@ -202,23 +259,27 @@ def render(menu):
         )
         inventory_df = pd.read_sql_query(
             '''
-            SELECT li.location_id, li.item_code, i.item_name, li.quantity,
+            SELECT li.location_id, li.item_code, i.item_name,
+                   MIN(li.quantity, COALESCE(als.quantity,0)) AS quantity,
                    COALESCE(lp.price, 0) AS price
             FROM location_inventory li
             LEFT JOIN inventory i ON li.item_code = i.item_code
             LEFT JOIN location_prices lp
                 ON lp.location_id = li.location_id AND lp.item_code = li.item_code
-            WHERE li.quantity > 0
+            LEFT JOIN admin_location_stock als
+                ON als.location_id=li.location_id AND LOWER(als.item_code)=LOWER(li.item_code)
+               AND LOWER(als.username)=LOWER(?)
+            WHERE li.quantity > 0 AND COALESCE(als.quantity,0) > 0
             ORDER BY i.item_name
             ''',
-            conn
+            conn,
+            params=(st.session_state.username,)
         )
         conn.close()
 
         locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
         inventory_df = inventory_df[inventory_df["location_id"].isin(assigned_location_ids)].copy()
-        if supplied_item_codes:
-            inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
+        inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
         inventory_df = inventory_df[inventory_df["price"] > 0].copy()
 
         st.markdown(
@@ -231,6 +292,89 @@ def render(menu):
             """,
             unsafe_allow_html=True
         )
+
+        if st.session_state.get("sales_page_mode") not in {"create", "view"}:
+            st.session_state.sales_page_mode = "create"
+        create_sale_col, view_sales_col = st.columns(2)
+        with create_sale_col:
+            if st.button(
+                "Create Sale",
+                type="primary" if st.session_state.sales_page_mode == "create" else "secondary",
+                width="stretch",
+                key="show_sales_create_page"
+            ):
+                st.session_state.sales_page_mode = "create"
+                st.rerun()
+        with view_sales_col:
+            if st.button(
+                "View Sales",
+                type="primary" if st.session_state.sales_page_mode == "view" else "secondary",
+                width="stretch",
+                key="show_sales_records_page"
+            ):
+                st.session_state.sales_page_mode = "view"
+                st.rerun()
+
+        if st.session_state.sales_page_mode == "view":
+            sales_records_conn = get_connection()
+            try:
+                sales_records_df = pd.read_sql_query(
+                    '''SELECT inv.id, inv.invoice_number, inv.location_id, l.name AS location,
+                              inv.customer_name,
+                              COALESCE((SELECT GROUP_CONCAT(ii.item_code, ', ')
+                                        FROM invoice_items ii WHERE ii.invoice_id=inv.id),'') AS items,
+                              COALESCE((SELECT SUM(ii.quantity)
+                                        FROM invoice_items ii WHERE ii.invoice_id=inv.id),0) AS quantity,
+                              COALESCE(inv.total,0) AS total,
+                              COALESCE((SELECT SUM(p.amount)
+                                        FROM payments p WHERE p.invoice_id=inv.id),0) AS paid,
+                              MAX(COALESCE(inv.total,0)-COALESCE((SELECT SUM(p.amount)
+                                        FROM payments p WHERE p.invoice_id=inv.id),0),0) AS balance,
+                              inv.status, inv.created_at
+                       FROM invoices inv
+                       LEFT JOIN locations l ON l.id=inv.location_id
+                       WHERE LOWER(inv.created_by)=LOWER(?)
+                       ORDER BY inv.id DESC''',
+                    sales_records_conn,
+                    params=(st.session_state.username,)
+                )
+            finally:
+                sales_records_conn.close()
+
+            sales_records_df = sales_records_df[
+                sales_records_df["location_id"].isin(assigned_location_ids)
+            ].copy()
+            st.markdown(
+                '<div class="dashboard-section-title">My Created Sales</div>',
+                unsafe_allow_html=True
+            )
+            if sales_records_df.empty:
+                st.info("You have not created any sales invoices for your assigned locations yet.")
+            else:
+                sales_records_df = sales_records_df[
+                    [
+                        "invoice_number", "location", "customer_name", "items", "quantity",
+                        "total", "paid", "balance", "status", "created_at",
+                    ]
+                ]
+                st.dataframe(
+                    sales_records_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "invoice_number": "Invoice",
+                        "location": "Location",
+                        "customer_name": "Customer",
+                        "items": "Items",
+                        "quantity": "Quantity",
+                        "total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                        "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
+                        "balance": st.column_config.NumberColumn("Balance", format="$%.2f"),
+                        "status": "Status",
+                        "created_at": "Created",
+                    }
+                )
+            return
 
         sale_form_col, sale_table_col = st.columns([0.9, 1.1])
 
@@ -267,7 +411,7 @@ def render(menu):
                 selected_location = st.selectbox(
                     "Location",
                     list(location_options.keys()),
-                    key="sales_location_selector"
+                    key=f"sales_location_selector_{sales_form_key}"
                 )
                 selected_location_id = location_options[selected_location]
                 available_items_df = inventory_df[inventory_df["location_id"] == selected_location_id].copy()
@@ -295,7 +439,7 @@ def render(menu):
                     selected_item = st.selectbox(
                         "Item",
                         list(item_options.keys()),
-                        key=f"sales_item_selector_{selected_location_id}"
+                        key=f"sales_item_selector_{sales_form_key}_{selected_location_id}"
                     )
                     selected_item_code = item_options[selected_item]
                     selected_item_row = available_items_df[
@@ -304,7 +448,7 @@ def render(menu):
                     available_quantity = int(selected_item_row["quantity"])
                     default_price = float(selected_item_row["price"])
 
-                    with st.form(f"sales_create_invoice_form_{selected_location_id}_{selected_item_code}"):
+                    with st.container(border=True):
                         st.markdown(
                             """
                             <div class="workflow-kicker">Step 3</div>
@@ -322,7 +466,8 @@ def render(menu):
                         )
                         customer_name = st.text_input(
                             "Customer Name",
-                            placeholder="Customer or company name"
+                            placeholder="Customer or company name",
+                            key=f"sales_customer_name_{sales_form_key}",
                         )
                         quantity_col, price_col = st.columns(2)
                         with quantity_col:
@@ -330,7 +475,10 @@ def render(menu):
                                 "Quantity",
                                 min_value=1,
                                 max_value=max(available_quantity, 1),
-                                step=1
+                                value=None,
+                                step=1,
+                                placeholder="Enter quantity",
+                                key=f"sales_quantity_{sales_form_key}_{selected_location_id}_{selected_item_code}"
                             )
                         with price_col:
                             unit_price = st.number_input(
@@ -340,16 +488,18 @@ def render(menu):
                                 step=0.01,
                                 format="%.2f",
                                 disabled=True,
-                                help="Selling price is configured by Super Admin or Admin for this location."
+                                help="Selling price is configured by Super Admin or Admin for this location.",
+                                key=f"sales_unit_price_{sales_form_key}_{selected_location_id}_{selected_item_code}",
                             )
 
-                        sale_total_preview = int(sale_quantity) * float(unit_price)
+                        sale_quantity_preview = int(sale_quantity or 0)
+                        sale_total_preview = sale_quantity_preview * float(unit_price)
                         credit_col, payment_status_col = st.columns([0.9, 1.1])
                         with credit_col:
                             credit_status = st.selectbox(
                                 "Credit Sale",
                                 ["No", "Yes", "Partially Paid"],
-                                key=f"sales_credit_status_{selected_location_id}_{selected_item_code}"
+                                key=f"sales_credit_status_{sales_form_key}_{selected_location_id}_{selected_item_code}"
                             )
                         with payment_status_col:
                             payment_status_label = {
@@ -361,7 +511,7 @@ def render(menu):
                                 "Payment Status",
                                 value=payment_status_label,
                                 disabled=True,
-                                key=f"sales_payment_status_{selected_location_id}_{selected_item_code}"
+                                key=f"sales_payment_status_{sales_form_key}_{selected_location_id}_{selected_item_code}"
                             )
 
                         payment_amount = sale_total_preview if credit_status == "No" else 0.0
@@ -371,33 +521,49 @@ def render(menu):
                         if credit_status in {"No", "Partially Paid"}:
                             payment_amount_col, payment_method_col = st.columns([1, 1])
                             with payment_amount_col:
-                                payment_amount = st.number_input(
-                                    "Payment Amount",
-                                    min_value=0.0,
-                                    max_value=sale_total_preview,
-                                    value=sale_total_preview if credit_status == "No" else 0.0,
-                                    step=0.01,
-                                    format="%.2f",
-                                    disabled=credit_status == "No",
-                                    help="Full payment is automatic for No; enter the received amount for partially paid credit sales."
-                                )
+                                if credit_status == "No":
+                                    payment_amount = sale_total_preview
+                                    st.text_input(
+                                        "Payment Amount",
+                                        value=f"${sale_total_preview:,.2f}",
+                                        disabled=True,
+                                        key=(
+                                            f"sales_full_payment_{sales_form_key}_{selected_location_id}_"
+                                            f"{selected_item_code}_{sale_total_preview:.2f}"
+                                        ),
+                                        help="Full payment automatically matches the live sale total."
+                                    )
+                                else:
+                                    payment_amount = st.number_input(
+                                        "Payment Amount",
+                                        min_value=0.0,
+                                        max_value=sale_total_preview,
+                                        value=None,
+                                        step=0.01,
+                                        format="%.2f",
+                                        placeholder="Enter partial payment",
+                                        key=f"sales_partial_payment_{sales_form_key}_{selected_location_id}_{selected_item_code}",
+                                        help="Enter an amount greater than zero and less than the sale total."
+                                    )
                             with payment_method_col:
                                 payment_method = st.selectbox(
                                     "Payment Method",
-                                    ["cash", "check", "wire", "credit_card"]
+                                    ["cash", "check", "wire", "credit_card"],
+                                    key=f"sales_payment_method_{sales_form_key}",
                                 )
                             reference_number = st.text_input(
                                 "Payment Reference",
-                                placeholder="Check number, wire ID, card note, or receipt number"
+                                placeholder="Check number, wire ID, card note, or receipt number",
+                                key=f"sales_payment_reference_{sales_form_key}",
                             )
                         else:
                             st.caption("No payment details are required for unpaid credit sales.")
 
-                        if credit_status == "Partially Paid" and payment_amount <= 0:
+                        if credit_status == "Partially Paid" and float(payment_amount or 0) <= 0:
                             st.warning("Enter the partial payment amount before creating the sale.")
-                        paid_preview = float(payment_amount)
+                        paid_preview = float(payment_amount or 0)
                         balance_preview = max(sale_total_preview - paid_preview, 0)
-                        sale_stock_after = max(available_quantity - int(sale_quantity), 0)
+                        sale_stock_after = max(available_quantity - sale_quantity_preview, 0)
                         st.markdown(
                             f"""
                             <div class="modern-form-summary">
@@ -424,13 +590,21 @@ def render(menu):
                             """,
                             unsafe_allow_html=True
                         )
-                        create_sale_invoice = st.form_submit_button("Create Sale", type="primary", width="stretch")
+                        create_sale_invoice = st.button(
+                            "Create Sale",
+                            type="primary",
+                            width="stretch",
+                            key=f"sales_create_button_{sales_form_key}_{selected_location_id}_{selected_item_code}"
+                        )
 
                 if create_sale_invoice:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if sale_quantity is None or int(sale_quantity) <= 0:
+                        st.error("Enter a quantity greater than zero before creating the sale.")
+                        st.stop()
                     quantity_int = int(sale_quantity)
                     line_total = round(quantity_int * float(unit_price), 2)
-                    payment_amount_rounded = round(float(payment_amount), 2)
+                    payment_amount_rounded = round(float(payment_amount or 0), 2)
                     if not customer_name.strip():
                         st.error("Customer Name is required before creating a sale.")
                         st.stop()
@@ -455,6 +629,17 @@ def render(menu):
 
                     try:
                         c.execute("BEGIN IMMEDIATE")
+                        try:
+                            validate_sales_sale_access(
+                                c,
+                                st.session_state.username,
+                                selected_location_id,
+                                selected_item_code
+                            )
+                        except ValueError as access_error:
+                            conn.rollback()
+                            st.error(str(access_error))
+                            st.stop()
                         c.execute(
                             '''
                             SELECT quantity FROM location_inventory
@@ -491,10 +676,15 @@ def render(menu):
                                 "and review the updated price before creating the sale."
                             )
                         else:
-                            consume_invoice_location_ownership(
-                                c, "super_admin", st.session_state.username,
-                                selected_location_id, selected_item_code, quantity_int
-                            )
+                            try:
+                                consume_invoice_location_ownership(
+                                    c, "admin", st.session_state.username,
+                                    selected_location_id, selected_item_code, quantity_int
+                                )
+                            except ValueError as ownership_error:
+                                conn.rollback()
+                                st.error(str(ownership_error))
+                                st.stop()
                             c.execute(
                                 '''
                                 UPDATE location_inventory
@@ -588,6 +778,7 @@ def render(menu):
                             st.session_state.sales_invoice_message = (
                                 f"Sale invoice {invoice_number} created successfully. Assigned location inventory was reduced and payment details were saved if provided."
                             )
+                            st.session_state.sales_sale_form_reset_counter += 1
                             st.rerun()
                     finally:
                         conn.close()
