@@ -11,6 +11,16 @@ def configure(context):
     )
 
 
+def calculate_company_physical_quantity(location_quantity, user_quantity):
+    """Return physical units held in company locations and Standard User accounts."""
+    return max(int(location_quantity or 0), 0) + max(int(user_quantity or 0), 0)
+
+
+def is_dashboard_usage_transaction(transaction_type):
+    """Dashboard usage analytics represent completed sales, not every stock movement."""
+    return str(transaction_type or "").strip().lower() == "sale"
+
+
 def calculate_admin_location_capacity(
     base_quantity, total_location_quantity, selected_location_quantity,
     selected_location_admin_owned, selected_admin_remaining, unowned_elsewhere=0,
@@ -955,15 +965,47 @@ def render(menu):
             conn
         )
 
+        admin_owned_stock_df = pd.DataFrame()
+        if not is_super_admin():
+            admin_owned_stock_df = pd.read_sql_query(
+                '''
+                SELECT als.location_id, als.item_code, i.item_name,
+                       COALESCE(als.quantity, 0) AS quantity
+                FROM admin_location_stock als
+                LEFT JOIN inventory i ON LOWER(i.item_code)=LOWER(als.item_code)
+                WHERE LOWER(als.username)=LOWER(?)
+                ''',
+                conn,
+                params=(st.session_state.username,)
+            )
+        else:
+            inventory_df = pd.read_sql_query(
+                '''
+                SELECT i.item_code, i.item_name,
+                       COALESCE(location_totals.quantity, 0)
+                       + COALESCE(user_totals.quantity, 0) AS quantity
+                FROM inventory i
+                LEFT JOIN (
+                    SELECT LOWER(item_code) AS item_code_key, SUM(MAX(quantity, 0)) AS quantity
+                    FROM location_inventory
+                    GROUP BY LOWER(item_code)
+                ) location_totals ON location_totals.item_code_key=LOWER(i.item_code)
+                LEFT JOIN (
+                    SELECT LOWER(item_code) AS item_code_key, SUM(MAX(quantity, 0)) AS quantity
+                    FROM user_inventory
+                    GROUP BY LOWER(item_code)
+                ) user_totals ON user_totals.item_code_key=LOWER(i.item_code)
+                ORDER BY i.item_name, i.item_code
+                ''',
+                conn
+            )
+
         conn.close()
 
         if not is_super_admin():
             assigned_location_ids = get_assigned_location_ids()
             supplied_item_codes = set(get_supplied_item_codes())
 
-            location_inventory_df = location_inventory_df[
-                location_inventory_df["location_id"].isin(assigned_location_ids)
-            ].copy()
             invoice_activity_df = invoice_activity_df[
                 invoice_activity_df["location_id"].isin(assigned_location_ids)
             ].copy()
@@ -973,23 +1015,35 @@ def render(menu):
             ].copy()
 
             if supplied_item_codes:
-                location_inventory_df = location_inventory_df[
-                    location_inventory_df["item_code"].isin(supplied_item_codes)
+                admin_owned_stock_df = admin_owned_stock_df[
+                    admin_owned_stock_df["location_id"].isin(assigned_location_ids)
+                    & admin_owned_stock_df["item_code"].isin(supplied_item_codes)
                 ].copy()
                 invoice_activity_df = invoice_activity_df[
                     invoice_activity_df["item_code"].isin(supplied_item_codes)
                 ].copy()
-            else:
-                location_inventory_df = location_inventory_df.iloc[0:0].copy()
-                invoice_activity_df = invoice_activity_df.iloc[0:0].copy()
 
-            if location_inventory_df.empty:
-                inventory_df = inventory_df.iloc[0:0].copy()
-            else:
-                inventory_df = (
-                    location_inventory_df.groupby(["item_code", "item_name"], as_index=False)["quantity"]
-                    .sum()
+                visible_products_df = inventory_df[
+                    inventory_df["item_code"].isin(supplied_item_codes)
+                ][["item_code", "item_name"]].drop_duplicates().copy()
+                owned_totals_df = (
+                    admin_owned_stock_df.groupby("item_code", as_index=False)["quantity"].sum()
+                    if not admin_owned_stock_df.empty
+                    else pd.DataFrame(columns=["item_code", "quantity"])
                 )
+                inventory_df = visible_products_df.merge(
+                    owned_totals_df,
+                    on="item_code",
+                    how="left"
+                )
+                inventory_df["quantity"] = (
+                    pd.to_numeric(inventory_df["quantity"], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                )
+            else:
+                invoice_activity_df = invoice_activity_df.iloc[0:0].copy()
+                inventory_df = inventory_df.iloc[0:0].copy()
 
             trans_df = invoice_activity_df.rename(columns={"id": "invoice_id"}).copy()
             if not trans_df.empty:
@@ -1005,12 +1059,15 @@ def render(menu):
         total_stock = int(inventory_df["quantity"].sum()) if not inventory_df.empty else 0
         low_stock = int((inventory_df["quantity"] <= 5).sum()) if not inventory_df.empty else 0
         total_transactions = len(trans_df)
-        total_used = int(trans_df["quantity_used"].sum()) if not trans_df.empty else 0
+        usage_trans_df = trans_df[
+            trans_df["transaction_type"].apply(is_dashboard_usage_transaction)
+        ].copy() if not trans_df.empty else trans_df.copy()
+        total_used = int(usage_trans_df["quantity_used"].sum()) if not usage_trans_df.empty else 0
         username_safe = safe_html(st.session_state.username)
         role_label = "Super Admin" if is_super_admin() else "Admin"
         dashboard_scope = "company-wide" if is_super_admin() else "assigned-location and supplied-product"
-        products_note = "Active inventory items" if is_super_admin() else "Visible supplied products"
-        stock_note = "Units available now" if is_super_admin() else "Visible assigned-location stock"
+        products_note = "Master inventory items" if is_super_admin() else "Visible supplied products"
+        stock_note = "Physical units company-wide" if is_super_admin() else "Your stock in assigned locations"
         activity_note = "Usage records saved" if is_super_admin() else "Visible invoice activity"
         users_label = "Users" if is_super_admin() else "Scope"
         users_note = "System accounts" if is_super_admin() else "Your scoped access"
@@ -1102,7 +1159,7 @@ def render(menu):
             )
 
         st.markdown(
-            """
+            f"""
             <div class="dashboard-section-title">Reports & Analytics</div>
             <div class="content-panel" style="margin-bottom: 0.9rem;">
                 <div class="dashboard-card-label">Operational insight</div>
@@ -1117,18 +1174,18 @@ def render(menu):
         with report_col1:
             usage_overview_html = '<div class="analytics-empty">No transaction data available yet.</div>'
 
-            if not trans_df.empty:
-                usage_chart_df = trans_df.copy()
+            if not usage_trans_df.empty:
+                usage_chart_df = usage_trans_df.copy()
                 usage_chart_df["transaction_date"] = pd.to_datetime(
                     usage_chart_df["transaction_time"],
                     errors="coerce"
-                ).dt.strftime("%b %d")
+                ).dt.normalize()
                 usage_chart_df = usage_chart_df.dropna(subset=["transaction_date"])
 
                 if not usage_chart_df.empty:
                     usage_by_date = usage_chart_df.groupby("transaction_date")[
                         "quantity_used"
-                    ].sum().tail(7)
+                    ].sum().sort_index().tail(7)
                     max_usage = max(int(usage_by_date.max()), 1)
                     y_axis_values = [max_usage, round(max_usage * 0.67), round(max_usage * 0.33), 0]
                     y_axis_html = "".join(
@@ -1137,7 +1194,8 @@ def render(menu):
                     )
                     usage_rows = []
 
-                    for date_label, quantity_used in usage_by_date.items():
+                    for transaction_date, quantity_used in usage_by_date.items():
+                        date_label = transaction_date.strftime("%b %d")
                         percent = min(int((int(quantity_used) / max_usage) * 100), 100)
                         usage_rows.append(
                             f'<div class="analytics-bar-item">'
@@ -1169,8 +1227,8 @@ def render(menu):
         with report_col2:
             usage_by_item_html = '<div class="analytics-empty">No item usage yet.</div>'
 
-            if not trans_df.empty:
-                usage_by_item_df = trans_df.groupby("item_code")[
+            if not usage_trans_df.empty:
+                usage_by_item_df = usage_trans_df.groupby("item_code")[
                     "quantity_used"
                 ].sum().sort_values(ascending=False).head(6)
 
@@ -1241,9 +1299,13 @@ def render(menu):
                     recent_transaction_columns = ["item_code", "quantity_used", "transaction_time"]
                     if is_super_admin():
                         recent_transaction_columns.insert(0, "username")
-                    recent_trans_df = trans_df.sort_values("id", ascending=False).head(5)[
-                        recent_transaction_columns
-                    ]
+                    recent_trans_df = trans_df.copy()
+                    recent_trans_df["_sort_time"] = pd.to_datetime(
+                        recent_trans_df["transaction_time"], errors="coerce"
+                    )
+                    recent_trans_df = recent_trans_df.sort_values(
+                        ["_sort_time", "id"], ascending=[False, False], na_position="last"
+                    ).head(5)[recent_transaction_columns]
                     st.dataframe(recent_trans_df, width="stretch", hide_index=True)
 
         with detail_col3:
@@ -1282,8 +1344,8 @@ def render(menu):
                     st.markdown("".join(status_rows), unsafe_allow_html=True)
 
         most_used_item = (
-            trans_df.groupby("item_code")["quantity_used"].sum().idxmax()
-            if not trans_df.empty else "No usage yet"
+            usage_trans_df.groupby("item_code")["quantity_used"].sum().idxmax()
+            if not usage_trans_df.empty else "No sales yet"
         )
         most_used_item_safe = safe_html(most_used_item)
 
