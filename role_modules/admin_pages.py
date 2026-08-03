@@ -13,11 +13,15 @@ def configure(context):
 
 def calculate_admin_location_capacity(
     base_quantity, total_location_quantity, selected_location_quantity,
-    selected_location_admin_owned, selected_admin_remaining, unowned_elsewhere=0
+    selected_location_admin_owned, selected_admin_remaining, unowned_elsewhere=0,
+    personal_user_quantity=0,
 ):
     """Return assignable ownership, existing stock used, and physical stock that may be added."""
     unowned_at_location = max(int(selected_location_quantity) - int(selected_location_admin_owned), 0)
-    unlocated_company_stock = max(int(base_quantity) - int(total_location_quantity), 0)
+    unlocated_company_stock = max(
+        int(base_quantity) - int(total_location_quantity) - int(personal_user_quantity),
+        0,
+    )
     available = min(
         max(int(selected_admin_remaining), 0),
         unowned_at_location + max(int(unowned_elsewhere), 0) + unlocated_company_stock,
@@ -1571,6 +1575,12 @@ def render(menu):
                 )
                 selected_location_admin_quantity = int(c.fetchone()[0] or 0)
                 c.execute(
+                    '''SELECT COALESCE(SUM(quantity),0) FROM user_inventory
+                       WHERE LOWER(item_code)=LOWER(?)''',
+                    (item_code,)
+                )
+                total_personal_user_quantity = int(c.fetchone()[0] or 0)
+                c.execute(
                     '''
                     SELECT DISTINCT u.username, u.role
                     FROM users u
@@ -1599,7 +1609,10 @@ def render(menu):
                     0
                 )
                 unassigned_quantity = max(
-                    selected_base_quantity - all_assigned_quantity - admin_reserved_remaining,
+                    selected_base_quantity
+                    - all_assigned_quantity
+                    - total_personal_user_quantity
+                    - admin_reserved_remaining,
                     0
                 )
                 admin_assigned_quantity = (
@@ -1717,6 +1730,7 @@ def render(menu):
                             selected_location_admin_quantity,
                             selected_user_reserved_remaining,
                             unowned_company_stock_elsewhere,
+                            total_personal_user_quantity,
                         )
                         max_for_selected_location = selected_admin_capacity["available"]
                     else:
@@ -1757,6 +1771,7 @@ def render(menu):
                         selected_location_admin_quantity,
                         admin_available_from_assignment,
                         admin_unowned_company_stock_elsewhere,
+                        total_personal_user_quantity,
                     )
                     max_for_selected_location = admin_capacity["available"]
                     location_quantity_label = "Quantity To Add"
@@ -1850,51 +1865,48 @@ def render(menu):
                             all_assigned_quantity + physical_add_preview - relocation_from_elsewhere_preview
                         )
                         quantity_to_add_is_valid = int(location_quantity) <= max_for_selected_location
-                        ruth_qty_col1, ruth_qty_col2, ruth_qty_col3, ruth_qty_col4 = st.columns(4)
-                        with ruth_qty_col1:
-                            st.markdown(
-                                f"""
-                                <div class="dashboard-card">
-                                    <div class="dashboard-card-label">Base Item Quantity</div>
-                                    <div class="dashboard-card-value">{selected_base_quantity}</div>
-                                    <div class="dashboard-card-note">Total quantity created for this item</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                        with ruth_qty_col2:
-                            st.markdown(
-                                f"""
-                                <div class="dashboard-card">
-                                <div class="dashboard-card-label">Total Physical Stock Here</div>
-                                <div class="dashboard-card-value">{current_location_quantity}</div>
-                                <div class="dashboard-card-note">Actual saved stock; {selected_location_admin_quantity} placed here by assigned users</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                        with ruth_qty_col3:
-                            st.markdown(
-                                f"""
-                                <div class="dashboard-card">
-                                    <div class="dashboard-card-label">Selected User Assignment</div>
-                                    <div class="dashboard-card-value">{selected_user_assigned_quantity}</div>
-                                    <div class="dashboard-card-note">{selected_user_assignment_note}</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                        with ruth_qty_col4:
-                            st.markdown(
-                                f"""
-                                <div class="dashboard-card">
-                                <div class="dashboard-card-label">Available To Add</div>
-                                    <div class="dashboard-card-value">{max_for_selected_location}</div>
-                                    <div class="dashboard-card-note">{(f'{selected_user_reserved_remaining} reservation; uses unowned stock here, then company stock elsewhere' if selected_access_role in {'admin', 'sales'} else f'After location stock and {admin_reserved_remaining} user-reserved units')}</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
+                        ruth_card_values = [
+                            (
+                                "Base Item Quantity",
+                                selected_base_quantity,
+                                "Total quantity created for this item",
+                            ),
+                            (
+                                "Physical Stock — All Locations",
+                                all_assigned_quantity,
+                                "Actual saved stock across every location",
+                            ),
+                            (
+                                "Physical Stock — Selected Location",
+                                current_location_quantity,
+                                f"Actual saved stock; {selected_location_admin_quantity} owned by assigned users here",
+                            ),
+                            (
+                                "Selected User Assignment",
+                                selected_user_assigned_quantity,
+                                selected_user_assignment_note,
+                            ),
+                            (
+                                "Available To Add",
+                                max_for_selected_location,
+                                (
+                                    f"{selected_user_reserved_remaining} remaining assignment; uses available company stock"
+                                    if selected_access_role in {"admin", "sales"}
+                                    else f"After location stock and {admin_reserved_remaining} user-reserved units"
+                                ),
+                            ),
+                        ]
+                        ruth_card_cols = st.columns(5)
+                        for ruth_card_col, (label, value, note) in zip(ruth_card_cols, ruth_card_values):
+                            with ruth_card_col:
+                                st.markdown(
+                                    f'''<div class="dashboard-card">
+                                        <div class="dashboard-card-label">{label}</div>
+                                        <div class="dashboard-card-value">{value}</div>
+                                        <div class="dashboard-card-note">{note}</div>
+                                    </div>''',
+                                    unsafe_allow_html=True,
+                                )
                         if quantity_to_add_is_valid:
                             st.caption(
                                 f"{quantity_limit_note} After save, this location will show "
@@ -2083,6 +2095,11 @@ def render(menu):
                             (item_code,)
                         )
                         locked_admin_placed_total = int(c.fetchone()[0] or 0)
+                        c.execute(
+                            "SELECT COALESCE(SUM(quantity),0) FROM user_inventory WHERE LOWER(item_code)=LOWER(?)",
+                            (item_code,)
+                        )
+                        locked_personal_user_total = int(c.fetchone()[0] or 0)
                         locked_admin_reserved = max(
                             locked_admin_assigned_total - locked_admin_placed_total,
                             0
@@ -2134,6 +2151,7 @@ def render(menu):
                                     - max(locked_selected_location_quantity - locked_location_admin_owned, 0),
                                     0
                                 ),
+                                locked_personal_user_total,
                             )
                             locked_company_available = locked_selected_capacity["available"]
                             locked_ownership_from_existing = min(
@@ -2142,7 +2160,10 @@ def render(menu):
                             )
                         else:
                             locked_company_available = max(
-                                locked_base_quantity - locked_location_total - locked_admin_reserved,
+                                locked_base_quantity
+                                - locked_location_total
+                                - locked_personal_user_total
+                                - locked_admin_reserved,
                                 0
                             )
                         if is_super_admin() and quantity_set > locked_company_available:
@@ -2204,6 +2225,7 @@ def render(menu):
                                     - max(locked_selected_location_quantity - locked_location_admin_owned, 0),
                                     0
                                 ),
+                                locked_personal_user_total,
                             )
                             locked_ownership_from_existing = min(
                                 quantity_set, locked_selected_capacity["unowned_at_location"]

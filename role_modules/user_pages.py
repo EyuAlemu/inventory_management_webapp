@@ -525,6 +525,12 @@ def render(menu):
                 user_assigned_quantity = 0
                 if receiving_standard_user_stock:
                     c.execute(
+                        '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                           WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                        (selected_location_id, item_code),
+                    )
+                    selected_location_owned_quantity = int(c.fetchone()[0] or 0)
+                    c.execute(
                         '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
                            WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
                         (st.session_state.username, item_code)
@@ -536,7 +542,7 @@ def render(menu):
                 user_available_to_receive = calculate_user_receive_capacity(
                     user_assigned_quantity,
                     user_quantity,
-                    int(item[4]),
+                    max(location_quantity - selected_location_owned_quantity, 0),
                 )
                 sales_available_to_receive = calculate_sales_receive_capacity(
                     sales_assigned_quantity,
@@ -805,7 +811,10 @@ def render(menu):
                                     locked_user_available_to_receive = calculate_user_receive_capacity(
                                         locked_user_assigned_quantity,
                                         user_quantity_before,
-                                        system_quantity_before,
+                                        max(
+                                            location_quantity_before - locked_selected_location_owned,
+                                            0,
+                                        ),
                                     )
                                     if transfer_qty_int > locked_user_available_to_receive:
                                         transfer_conn.rollback()
@@ -819,7 +828,7 @@ def render(menu):
                                     system_quantity_after = (
                                         system_quantity_before
                                         if receiving_sales_stock
-                                        else system_quantity_before - transfer_qty_int
+                                        else system_quantity_before
                                     )
                                     account_quantity_before = (
                                         locked_sales_location_quantity
@@ -844,16 +853,6 @@ def render(menu):
                                     physical_location_quantity_after = (
                                         location_quantity_before + physical_quantity_to_add
                                     )
-
-                                    if not receiving_sales_stock:
-                                        transfer_c.execute(
-                                            '''
-                                            UPDATE inventory
-                                            SET quantity=?
-                                            WHERE id=?
-                                            ''',
-                                            (system_quantity_after, int(current_inventory[0]))
-                                        )
 
                                     if receiving_sales_stock:
                                         transfer_c.execute(
@@ -900,6 +899,28 @@ def render(menu):
                                             )
                                         )
                                     else:
+                                        personal_source_after = location_quantity_before - transfer_qty_int
+                                        transfer_c.execute(
+                                            '''UPDATE location_inventory SET quantity=?
+                                               WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                                            (personal_source_after, selected_location_id, item_code),
+                                        )
+                                        transfer_c.execute(
+                                            '''INSERT INTO location_stock_history
+                                               (location_id,item_code,quantity_before,quantity_set,quantity_after,
+                                                action_type,updated_by,updated_at)
+                                               VALUES (?,?,?,?,?,?,?,?)''',
+                                            (
+                                                selected_location_id,
+                                                item_code,
+                                                location_quantity_before,
+                                                -transfer_qty_int,
+                                                personal_source_after,
+                                                "Standard User Receive",
+                                                st.session_state.username,
+                                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                            ),
+                                        )
                                         transfer_c.execute(
                                             '''
                                             INSERT INTO user_inventory (username,item_code,quantity)
@@ -936,7 +957,8 @@ def render(menu):
                                         if receiving_sales_stock
                                         else
                                         f"{transfer_qty_int} unit(s) received. Account quantity is now "
-                                        f"{account_quantity_after}."
+                                        f"{account_quantity_after}; selected location quantity is now "
+                                        f"{personal_source_after}."
                                     )
                                     st.session_state.scan_reset_receive_quantity = True
                                     st.rerun()
@@ -978,10 +1000,20 @@ def render(menu):
                                     try:
                                         return_c.execute("BEGIN IMMEDIATE")
                                         return_c.execute(
-                                            "SELECT id, quantity FROM inventory WHERE item_code=?",
+                                            "SELECT id FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                                             (item_code,)
                                         )
                                         current_inventory = return_c.fetchone()
+                                        return_c.execute(
+                                            '''SELECT COALESCE(quantity,0) FROM location_inventory
+                                               WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                                            (selected_location_id, item_code),
+                                        )
+                                        return_location_row = return_c.fetchone()
+                                        return_location_before = (
+                                            int(return_location_row[0] or 0)
+                                            if return_location_row else 0
+                                        )
                                         return_c.execute(
                                             '''
                                             SELECT quantity FROM user_inventory
@@ -1002,10 +1034,12 @@ def render(menu):
                                             st.error("You do not have enough stock to return that quantity.")
                                         else:
                                             user_quantity_after = user_quantity_before - return_qty_int
-                                            system_quantity_after = int(current_inventory[1]) + return_qty_int
                                             return_c.execute(
-                                                "UPDATE inventory SET quantity=? WHERE id=?",
-                                                (system_quantity_after, int(current_inventory[0]))
+                                                '''INSERT INTO location_inventory (location_id,item_code,quantity)
+                                                   VALUES (?,?,?)
+                                                   ON CONFLICT(location_id,item_code)
+                                                   DO UPDATE SET quantity=location_inventory.quantity+excluded.quantity''',
+                                                (selected_location_id, item_code, return_qty_int),
                                             )
                                             return_c.execute(
                                                 '''
@@ -1014,6 +1048,22 @@ def render(menu):
                                                 WHERE username=? AND item_code=?
                                                 ''',
                                                 (user_quantity_after, st.session_state.username, item_code)
+                                            )
+                                            return_c.execute(
+                                                '''INSERT INTO location_stock_history
+                                                   (location_id,item_code,quantity_before,quantity_set,quantity_after,
+                                                    action_type,updated_by,updated_at)
+                                                   VALUES (?,?,?,?,?,?,?,?)''',
+                                                (
+                                                    selected_location_id,
+                                                    item_code,
+                                                    return_location_before,
+                                                    return_qty_int,
+                                                    return_location_before + return_qty_int,
+                                                    "Standard User Return",
+                                                    st.session_state.username,
+                                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                                ),
                                             )
                                             return_c.execute(
                                                 '''
@@ -1035,7 +1085,8 @@ def render(menu):
                                             )
                                             return_conn.commit()
                                             st.session_state.scan_inventory_message = (
-                                                f"{return_qty_int} unit(s) returned to inventory. Your quantity is now {user_quantity_after}."
+                                                f"{return_qty_int} unit(s) returned to the selected location. "
+                                                f"Your quantity is now {user_quantity_after}."
                                             )
                                             st.session_state.scan_reset_user_actions = True
                                             st.rerun()
@@ -1425,6 +1476,10 @@ def render(menu):
         if has_admin_access() and not is_super_admin():
             assigned_location_ids = get_assigned_location_ids()
             supplied_item_codes = set(get_supplied_item_codes())
+            df = df[
+                df["username"].fillna("").astype(str).str.lower()
+                == str(st.session_state.username).lower()
+            ].copy()
             df = df[df["location_id"].isin(assigned_location_ids)].copy()
 
             if supplied_item_codes:
@@ -1434,12 +1489,17 @@ def render(menu):
         elif not has_admin_access() and not df.empty:
             df = df[df["username"] == st.session_state.username].copy()
 
+        transaction_scope_description = (
+            "Review company-wide inventory usage history by user, item code, quantity, and time."
+            if is_super_admin()
+            else "Review only inventory activity recorded by your account."
+        )
         st.markdown(
-            """
+            f"""
             <div class="page-header">
                 <div class="page-eyebrow">Activity</div>
                 <div class="page-title">Transaction Logs</div>
-                <p class="page-subtitle">Review inventory usage history by user, item code, quantity, and time.</p>
+                <p class="page-subtitle">{transaction_scope_description}</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -1520,7 +1580,7 @@ def render(menu):
         else:
             search_term = st.text_input(
                 "Search logs",
-                placeholder="Search by user or item code",
+                placeholder="Search by user or item code" if is_super_admin() else "Search by item code",
                 label_visibility="collapsed"
             )
 
@@ -1558,7 +1618,7 @@ def render(menu):
                 "verification",
                 "transaction_time",
             ]
-            if has_admin_access():
+            if is_super_admin():
                 display_columns.insert(1, "username")
             display_df = display_df[display_columns]
 

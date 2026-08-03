@@ -20,6 +20,17 @@ def calculate_sales_receive_capacity(
     return min(assignment_available, unowned_at_location + unlocated_capacity)
 
 
+def calculate_sales_payment_status(total, paid):
+    """Classify an invoice from its durable total and payment records."""
+    total_value = max(float(total or 0), 0.0)
+    paid_value = max(float(paid or 0), 0.0)
+    if total_value > 0 and paid_value >= total_value:
+        return "Paid"
+    if paid_value > 0:
+        return "Partially Paid"
+    return "Credit / Unpaid"
+
+
 def validate_sales_sale_access(cursor, username, location_id, item_code):
     """Confirm that a Sales user still has active location and product access."""
     cursor.execute(
@@ -330,6 +341,11 @@ def render(menu):
                                         FROM payments p WHERE p.invoice_id=inv.id),0) AS paid,
                               MAX(COALESCE(inv.total,0)-COALESCE((SELECT SUM(p.amount)
                                         FROM payments p WHERE p.invoice_id=inv.id),0),0) AS balance,
+                              COALESCE((SELECT GROUP_CONCAT(DISTINCT p.payment_method)
+                                        FROM payments p WHERE p.invoice_id=inv.id),'') AS payment_method,
+                              COALESCE((SELECT GROUP_CONCAT(DISTINCT p.reference_number)
+                                        FROM payments p WHERE p.invoice_id=inv.id
+                                          AND COALESCE(TRIM(p.reference_number),'')<>''),'') AS payment_reference,
                               inv.status, inv.created_at
                        FROM invoices inv
                        LEFT JOIN locations l ON l.id=inv.location_id
@@ -351,29 +367,84 @@ def render(menu):
             if sales_records_df.empty:
                 st.info("You have not created any sales invoices for your assigned locations yet.")
             else:
-                sales_records_df = sales_records_df[
+                sales_records_df["payment_status"] = sales_records_df.apply(
+                    lambda row: calculate_sales_payment_status(row["total"], row["paid"]),
+                    axis=1,
+                )
+
+                sales_search = st.text_input(
+                    "Search Sales",
+                    placeholder="Search invoice, customer, item, payment method, or reference",
+                    key="sales_records_search",
+                ).strip()
+                sales_filter_col1, sales_filter_col2 = st.columns(2)
+                with sales_filter_col1:
+                    sales_location_filter = st.selectbox(
+                        "Filter Location",
+                        ["All"] + sorted(sales_records_df["location"].dropna().astype(str).unique().tolist()),
+                        key="sales_records_location_filter",
+                    )
+                with sales_filter_col2:
+                    sales_payment_filter = st.selectbox(
+                        "Filter Payment Status",
+                        ["All", "Paid", "Partially Paid", "Credit / Unpaid"],
+                        key="sales_records_payment_filter",
+                    )
+
+                sales_display_df = sales_records_df.copy()
+                if sales_search:
+                    normalized_search = sales_search.lower()
+                    searchable_columns = [
+                        "invoice_number", "customer_name", "items", "payment_method",
+                        "payment_reference", "payment_status",
+                    ]
+                    search_mask = pd.Series(False, index=sales_display_df.index)
+                    for search_column in searchable_columns:
+                        search_mask |= sales_display_df[search_column].fillna("").astype(str).str.lower().str.contains(
+                            normalized_search,
+                            regex=False,
+                        )
+                    sales_display_df = sales_display_df[search_mask].copy()
+                if sales_location_filter != "All":
+                    sales_display_df = sales_display_df[
+                        sales_display_df["location"].astype(str) == sales_location_filter
+                    ].copy()
+                if sales_payment_filter != "All":
+                    sales_display_df = sales_display_df[
+                        sales_display_df["payment_status"] == sales_payment_filter
+                    ].copy()
+
+                sales_display_df = sales_display_df[
                     [
                         "invoice_number", "location", "customer_name", "items", "quantity",
-                        "total", "paid", "balance", "status", "created_at",
+                        "total", "paid", "balance", "payment_status", "payment_method",
+                        "payment_reference", "status", "created_at",
                     ]
                 ]
-                st.dataframe(
-                    sales_records_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "invoice_number": "Invoice",
-                        "location": "Location",
-                        "customer_name": "Customer",
-                        "items": "Items",
-                        "quantity": "Quantity",
-                        "total": st.column_config.NumberColumn("Total", format="$%.2f"),
-                        "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
-                        "balance": st.column_config.NumberColumn("Balance", format="$%.2f"),
-                        "status": "Status",
-                        "created_at": "Created",
-                    }
-                )
+                if sales_display_df.empty:
+                    st.info("No created sales match the selected search and filters.")
+                else:
+                    st.caption(f"Showing {len(sales_display_df)} of {len(sales_records_df)} created sale(s).")
+                    st.dataframe(
+                        sales_display_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "invoice_number": "Invoice",
+                            "location": "Location",
+                            "customer_name": "Customer",
+                            "items": "Items",
+                            "quantity": "Quantity",
+                            "total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                            "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
+                            "balance": st.column_config.NumberColumn("Balance", format="$%.2f"),
+                            "payment_status": "Payment Status",
+                            "payment_method": "Payment Method",
+                            "payment_reference": "Payment Reference",
+                            "status": "Invoice Status",
+                            "created_at": "Created",
+                        }
+                    )
             return
 
         sale_form_col, sale_table_col = st.columns([0.9, 1.1])
