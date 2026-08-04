@@ -11,6 +11,62 @@ def configure(context):
     )
 
 
+def ensure_financial_schema(conn):
+    """Apply additive finance migrations before any Financials query runs."""
+    cursor = conn.cursor()
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS invoice_credits (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               invoice_id INTEGER NOT NULL,
+               return_id INTEGER,
+               amount REAL DEFAULT 0,
+               credit_type TEXT DEFAULT 'customer_return',
+               created_by TEXT,
+               created_at TEXT,
+               UNIQUE(return_id)
+           )'''
+    )
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS refunds (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               invoice_id INTEGER NOT NULL,
+               credit_id INTEGER,
+               amount REAL DEFAULT 0,
+               refund_method TEXT,
+               reference_number TEXT,
+               status TEXT DEFAULT 'completed',
+               processed_by TEXT,
+               processed_at TEXT
+           )'''
+    )
+    cursor.execute("PRAGMA table_info(refunds)")
+    refund_columns = {row[1] for row in cursor.fetchall()}
+    refund_migrations = {
+        "invoice_id": "INTEGER",
+        "credit_id": "INTEGER",
+        "amount": "REAL DEFAULT 0",
+        "refund_method": "TEXT",
+        "reference_number": "TEXT",
+        "status": "TEXT DEFAULT 'completed'",
+        "processed_by": "TEXT",
+        "processed_at": "TEXT",
+    }
+    for column_name, column_definition in refund_migrations.items():
+        if column_name not in refund_columns:
+            cursor.execute(
+                f"ALTER TABLE refunds ADD COLUMN {column_name} {column_definition}"
+            )
+    cursor.execute("PRAGMA table_info(invoice_items)")
+    invoice_item_columns = {row[1] for row in cursor.fetchall()}
+    if invoice_item_columns and "owner_username" not in invoice_item_columns:
+        cursor.execute("ALTER TABLE invoice_items ADD COLUMN owner_username TEXT")
+    cursor.execute("PRAGMA table_info(transactions)")
+    transaction_columns = {row[1] for row in cursor.fetchall()}
+    if transaction_columns and "affected_owner_username" not in transaction_columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN affected_owner_username TEXT")
+    conn.commit()
+
+
 def calculate_company_physical_quantity(location_quantity, user_quantity):
     """Return physical units held in company locations and Standard User accounts."""
     return max(int(location_quantity or 0), 0) + max(int(user_quantity or 0), 0)
@@ -2895,6 +2951,7 @@ def render(menu):
                 ):
                     st.session_state.pop(state_key, None)
         conn = get_connection()
+        ensure_financial_schema(conn)
         locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
         inventory_df = pd.read_sql_query("SELECT item_code, item_name FROM inventory ORDER BY item_name", conn)
         invoices_df = pd.read_sql_query(
