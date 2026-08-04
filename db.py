@@ -213,6 +213,10 @@ def init_db():
         line_total REAL DEFAULT 0
     )
     ''')
+    c.execute("PRAGMA table_info(invoice_items)")
+    invoice_item_columns = {column[1] for column in c.fetchall()}
+    if "owner_username" not in invoice_item_columns:
+        c.execute("ALTER TABLE invoice_items ADD COLUMN owner_username TEXT")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS payments (
@@ -236,6 +240,20 @@ def init_db():
         created_by TEXT,
         created_at TEXT,
         UNIQUE(return_id)
+    )
+    ''')
+
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS refunds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER NOT NULL,
+        credit_id INTEGER,
+        amount REAL DEFAULT 0,
+        refund_method TEXT,
+        reference_number TEXT,
+        status TEXT DEFAULT 'completed',
+        processed_by TEXT,
+        processed_at TEXT
     )
     ''')
 
@@ -327,6 +345,8 @@ def init_db():
 
     if "location_id" not in transaction_columns:
         c.execute("ALTER TABLE transactions ADD COLUMN location_id INTEGER")
+    if "affected_owner_username" not in transaction_columns:
+        c.execute("ALTER TABLE transactions ADD COLUMN affected_owner_username TEXT")
 
     c.execute("PRAGMA table_info(inventory)")
     inventory_columns = {column[1] for column in c.fetchall()}

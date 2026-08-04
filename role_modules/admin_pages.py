@@ -21,26 +21,63 @@ def is_dashboard_usage_transaction(transaction_type):
     return str(transaction_type or "").strip().lower() == "sale"
 
 
-def calculate_remaining_assignment(assigned_quantity, placed_quantity, written_off_quantity=0):
+def calculate_remaining_assignment(
+    assigned_quantity, placed_quantity, written_off_quantity=0, sold_quantity=0
+):
     """Return reservation still usable after placed and permanently written-off units."""
     return max(
         int(assigned_quantity or 0)
         - int(placed_quantity or 0)
-        - int(written_off_quantity or 0),
+        - int(written_off_quantity or 0)
+        - int(sold_quantity or 0),
         0,
     )
+
+
+def get_net_sold_quantity(cursor, item_code, owner_username=None):
+    """Return sold units not reversed by customer returns, optionally for one stock owner."""
+    owner_filter = ""
+    params = [item_code]
+    if owner_username is not None:
+        owner_filter = (
+            " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),username))=LOWER(?)"
+        )
+        params.append(owner_username)
+    cursor.execute(
+        f'''SELECT COALESCE(SUM(quantity_used),0) FROM transactions
+            WHERE LOWER(item_code)=LOWER(?) AND transaction_type='sale'{owner_filter}''',
+        tuple(params)
+    )
+    sold = int(cursor.fetchone()[0] or 0)
+    return_params = [item_code]
+    return_filter = ""
+    if owner_username is not None:
+        return_filter = (
+            " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)"
+        )
+        return_params.append(owner_username)
+    cursor.execute(
+        f'''SELECT COALESCE(SUM(quantity),0) FROM returns
+            WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+              AND condition_status IN ('customer_return','customer_return_damaged')
+              {return_filter}''',
+        tuple(return_params)
+    )
+    returned = int(cursor.fetchone()[0] or 0)
+    return max(sold - returned, 0)
 
 
 def calculate_admin_location_capacity(
     base_quantity, total_location_quantity, selected_location_quantity,
     selected_location_admin_owned, selected_admin_remaining, unowned_elsewhere=0,
-    personal_user_quantity=0, written_off_quantity=0,
+    personal_user_quantity=0, written_off_quantity=0, sold_quantity=0,
 ):
     """Return assignable ownership, existing stock used, and physical stock that may be added."""
     unowned_at_location = max(int(selected_location_quantity) - int(selected_location_admin_owned), 0)
     unlocated_company_stock = max(
         int(base_quantity) - int(total_location_quantity) - int(personal_user_quantity)
-        - int(written_off_quantity),
+        - int(written_off_quantity)
+        - int(sold_quantity),
         0,
     )
     available = min(
@@ -63,7 +100,9 @@ def calculate_invoice_available_quantity(role, physical_quantity, owned_quantity
     return min(physical_quantity, max(int(owned_quantity or 0), 0))
 
 
-def consume_invoice_location_ownership(cursor, role, username, location_id, item_code, quantity):
+def consume_invoice_location_ownership(
+    cursor, role, username, location_id, item_code, quantity, affected_owner_username=None
+):
     """Reduce ownership ledgers for an invoice without allowing an Admin to sell another owner's stock."""
     quantity = int(quantity)
     if role == "admin":
@@ -83,7 +122,7 @@ def consume_invoice_location_ownership(cursor, role, username, location_id, item
                WHERE LOWER(username)=LOWER(?) AND location_id=? AND LOWER(item_code)=LOWER(?)''',
             (quantity, username, location_id, item_code)
         )
-        return quantity
+        return username
 
     if role == "super_admin":
         cursor.execute(
@@ -101,25 +140,29 @@ def consume_invoice_location_ownership(cursor, role, username, location_id, item
         total_owned_quantity = int(cursor.fetchone()[0] or 0)
         generic_quantity = max(physical_quantity - total_owned_quantity, 0)
         remaining = max(quantity - generic_quantity, 0)
-        consumed = 0
+        if remaining <= 0:
+            return None
+        if not str(affected_owner_username or "").strip():
+            raise ValueError("Select the Admin or Sales owner whose stock will be sold.")
         cursor.execute(
-            '''SELECT id,quantity FROM admin_location_stock
-               WHERE location_id=? AND LOWER(item_code)=LOWER(?) AND quantity>0 ORDER BY id''',
-            (location_id, item_code)
+            '''SELECT COALESCE(quantity,0) FROM admin_location_stock
+               WHERE LOWER(username)=LOWER(?) AND location_id=? AND LOWER(item_code)=LOWER(?)''',
+            (affected_owner_username, location_id, item_code)
         )
-        for owner_id, owner_quantity in cursor.fetchall():
-            reduction = min(remaining, int(owner_quantity or 0))
-            if reduction:
-                cursor.execute(
-                    "UPDATE admin_location_stock SET quantity=quantity-? WHERE id=?",
-                    (reduction, owner_id)
-                )
-                consumed += reduction
-                remaining -= reduction
-            if remaining <= 0:
-                break
-        return consumed
-    return 0
+        owner_row = cursor.fetchone()
+        owner_quantity = int(owner_row[0] or 0) if owner_row else 0
+        if remaining > owner_quantity:
+            raise ValueError(
+                f"Only {generic_quantity} unowned and {owner_quantity} owned by "
+                f"{affected_owner_username} are available for this invoice."
+            )
+        cursor.execute(
+            '''UPDATE admin_location_stock SET quantity=quantity-?
+               WHERE LOWER(username)=LOWER(?) AND location_id=? AND LOWER(item_code)=LOWER(?)''',
+            (remaining, affected_owner_username, location_id, item_code)
+        )
+        return affected_owner_username
+    return None
 
 
 def record_return_stock(
@@ -153,7 +196,8 @@ def record_return_stock(
                 raise ValueError("Select the customer invoice associated with this return.")
             c.execute(
                 '''SELECT COALESCE(SUM(ii.quantity),0), inv.created_by,
-                          COALESCE(SUM(ii.line_total),0)
+                          COALESCE(SUM(ii.line_total),0),
+                          GROUP_CONCAT(DISTINCT ii.owner_username)
                    FROM invoice_items ii JOIN invoices inv ON inv.id=ii.invoice_id
                    WHERE inv.id=? AND inv.location_id=? AND LOWER(ii.item_code)=LOWER(?)
                      AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')
@@ -166,6 +210,7 @@ def record_return_stock(
             sold_quantity = int(invoice_row[0] or 0) if invoice_row else 0
             invoice_creator = str(invoice_row[1] or "") if invoice_row else ""
             sold_line_total = float(invoice_row[2] or 0) if invoice_row else 0.0
+            original_owner_username = str(invoice_row[3] or "").strip() if invoice_row else ""
             if role in {"admin", "sales"} and invoice_creator.lower() != str(username).lower():
                 raise ValueError("You can only receive returns for invoices you created.")
             c.execute(
@@ -187,6 +232,7 @@ def record_return_stock(
             inventory_action = "add" if is_sellable_customer_return else "write_off_return"
             action_type = "Customer Return" if is_sellable_customer_return else "Damaged Customer Return"
             if role in {"admin", "sales"}:
+                affected_owner_username = username
                 c.execute(
                     '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
                        WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
@@ -227,8 +273,18 @@ def record_return_stock(
                            DO UPDATE SET quantity=admin_location_stock.quantity+excluded.quantity''',
                         (username, location_id, item_code, quantity)
                     )
+                elif original_owner_username:
+                    affected_owner_username = original_owner_username
+                    c.execute(
+                        '''INSERT INTO admin_location_stock (username,location_id,item_code,quantity)
+                           VALUES (?,?,?,?) ON CONFLICT(username,location_id,item_code)
+                           DO UPDATE SET quantity=admin_location_stock.quantity+excluded.quantity''',
+                        (original_owner_username, location_id, item_code, quantity)
+                    )
             elif role in {"admin", "sales"}:
                 affected_owner_username = username
+            elif original_owner_username:
+                affected_owner_username = original_owner_username
         else:
             if role == "sales":
                 raise ValueError("Sales users cannot record damaged or unsellable stock.")
@@ -690,6 +746,21 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             conn,
             params=(st.session_state.get("username", ""),)
         )
+        admin_sold_df = pd.read_sql_query(
+            '''SELECT item_code,
+                      MAX(COALESCE(SUM(CASE WHEN transaction_type='sale' THEN quantity_used ELSE 0 END),0)
+                          - COALESCE((SELECT SUM(r.quantity) FROM returns r
+                              WHERE r.status='completed'
+                                AND r.condition_status IN ('customer_return','customer_return_damaged')
+                                AND LOWER(COALESCE(NULLIF(r.affected_owner_username,''),r.recorded_by))=LOWER(?)
+                                AND LOWER(r.item_code)=LOWER(t.item_code)),0),0) AS sold
+               FROM transactions t
+               WHERE transaction_type='sale'
+                 AND LOWER(COALESCE(NULLIF(affected_owner_username,''),username))=LOWER(?)
+               GROUP BY LOWER(item_code)''',
+            conn,
+            params=(st.session_state.get("username", ""), st.session_state.get("username", ""))
+        )
         conn.close()
         if not admin_stock_history_df.empty:
             allowed_history_df = admin_stock_history_df.copy()
@@ -723,6 +794,10 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             .fillna(0).astype(int).to_dict()
             if not admin_written_off_df.empty else {}
         )
+        admin_sold_by_item = (
+            admin_sold_df.set_index("item_code")["sold"].fillna(0).astype(int).to_dict()
+            if not admin_sold_df.empty else {}
+        )
         stock_display_df["assigned_by_ruth"] = (
             stock_display_df["item_code"].map(assigned_by_ruth_by_item).fillna(0).astype(int)
         )
@@ -731,6 +806,9 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
         ).clip(lower=0).astype(int)
         stock_display_df["written_off_by_admin"] = (
             stock_display_df["item_code"].map(admin_written_off_by_item).fillna(0).astype(int)
+        )
+        stock_display_df["sold_by_admin"] = (
+            stock_display_df["item_code"].map(admin_sold_by_item).fillna(0).astype(int)
         )
         stock_display_df["my_quantity_here"] = stock_display_df.apply(
             lambda row: int(
@@ -746,11 +824,12 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             stock_display_df["assigned_by_ruth"]
             - stock_display_df["quantity_added_by_admin"]
             - stock_display_df["written_off_by_admin"]
+            - stock_display_df["sold_by_admin"]
         ).clip(lower=0).astype(int)
         stock_display_df["assignment_status"] = stock_display_df.apply(
             lambda row: (
                 "Needs Super Admin Increase"
-                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"])
+                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"]) + int(row["sold_by_admin"])
                 > int(row["assigned_by_ruth"])
                 else "Available"
                 if int(row["available_to_add"]) > 0
@@ -768,15 +847,19 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
         assignment_summary_df["written_off_by_admin"] = (
             assignment_summary_df["item_code"].map(admin_written_off_by_item).fillna(0).astype(int)
         )
+        assignment_summary_df["sold_by_admin"] = (
+            assignment_summary_df["item_code"].map(admin_sold_by_item).fillna(0).astype(int)
+        )
         assignment_summary_df["available_to_add"] = (
             assignment_summary_df["assigned_by_ruth"]
             - assignment_summary_df["quantity_added_by_admin"]
             - assignment_summary_df["written_off_by_admin"]
+            - assignment_summary_df["sold_by_admin"]
         ).clip(lower=0).astype(int)
         assignment_summary_df["assignment_status"] = assignment_summary_df.apply(
             lambda row: (
                 "Over assignment"
-                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"])
+                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"]) + int(row["sold_by_admin"])
                 > int(row["assigned_by_ruth"])
                 else "Available"
                 if int(row["available_to_add"]) > 0
@@ -795,6 +878,7 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
                 "assigned_by_ruth": "Assigned To You",
                 "quantity_added_by_admin": "Added By You",
                 "written_off_by_admin": "Written Off / Damaged",
+                "sold_by_admin": "Net Sold",
                 "available_to_add": "Remaining Assignment",
                 "assignment_status": "Assignment Status",
             }
@@ -1802,6 +1886,16 @@ def render(menu):
                     (item_code,)
                 )
                 total_owner_written_off_quantity = int(c.fetchone()[0] or 0)
+                total_net_sold_quantity = get_net_sold_quantity(c, item_code)
+                c.execute(
+                    '''SELECT DISTINCT username FROM admin_product_allocations
+                       WHERE LOWER(item_code)=LOWER(?)''',
+                    (item_code,)
+                )
+                allocation_owners = [row[0] for row in c.fetchall()]
+                total_owner_net_sold_quantity = sum(
+                    get_net_sold_quantity(c, item_code, owner) for owner in allocation_owners
+                )
                 c.execute(
                     '''
                     SELECT DISTINCT u.username, u.role
@@ -1830,13 +1924,15 @@ def render(menu):
                     total_admin_assigned_quantity,
                     total_admin_placed_quantity,
                     total_owner_written_off_quantity,
+                    total_owner_net_sold_quantity,
                 )
                 unassigned_quantity = max(
                     selected_base_quantity
                     - all_assigned_quantity
                     - total_personal_user_quantity
                     - admin_reserved_remaining
-                    - total_written_off_quantity,
+                    - total_written_off_quantity
+                    - total_net_sold_quantity,
                     0
                 )
                 admin_assigned_quantity = (
@@ -1850,6 +1946,7 @@ def render(menu):
                 selected_user_placed_quantity = 0
                 selected_user_location_quantity = 0
                 selected_user_written_off_quantity = 0
+                selected_user_net_sold_quantity = 0
                 selected_user_reserved_remaining = 0
                 if is_super_admin() and assigned_user_rows:
                     assigned_user_options = {
@@ -1896,10 +1993,14 @@ def render(menu):
                                 (item_code, selected_access_username)
                             ).fetchone()[0] or 0
                         )
+                        selected_user_net_sold_quantity = get_net_sold_quantity(
+                            conn.cursor(), item_code, selected_access_username
+                        )
                         selected_user_reserved_remaining = calculate_remaining_assignment(
                             selected_user_assigned_quantity,
                             selected_user_placed_quantity,
                             selected_user_written_off_quantity,
+                            selected_user_net_sold_quantity,
                         )
                     conn.close()
                 if selected_access_role in {"admin", "sales"}:
@@ -1908,6 +2009,7 @@ def render(menu):
                         f"{selected_user_placed_quantity} placed total, "
                         f"{selected_user_location_quantity} here, "
                         f"{selected_user_written_off_quantity} written off, "
+                        f"{selected_user_net_sold_quantity} sold, "
                         f"{selected_user_reserved_remaining} reserved"
                     )
                 else:
@@ -1915,6 +2017,7 @@ def render(menu):
                 admin_added_quantity = 0
                 current_admin_location_quantity = 0
                 admin_written_off_quantity = 0
+                admin_net_sold_quantity = 0
                 if not is_super_admin():
                     conn = get_connection()
                     admin_stock_history_totals = pd.read_sql_query(
@@ -1949,6 +2052,9 @@ def render(menu):
                             (item_code, st.session_state.username)
                         ).fetchone()[0] or 0
                     )
+                    admin_net_sold_quantity = get_net_sold_quantity(
+                        conn.cursor(), item_code, st.session_state.username
+                    )
                     conn.close()
                 stock_mode_key = (
                     stock_page_mode.lower().replace(" ", "_").replace("/", "_")
@@ -1980,6 +2086,7 @@ def render(menu):
                             unowned_company_stock_elsewhere,
                             total_personal_user_quantity,
                             total_written_off_quantity,
+                            total_net_sold_quantity,
                         )
                         max_for_selected_location = selected_admin_capacity["available"]
                     else:
@@ -2004,6 +2111,7 @@ def render(menu):
                         admin_assigned_quantity,
                         admin_added_quantity,
                         admin_written_off_quantity,
+                        admin_net_sold_quantity,
                     )
                     admin_location_unowned_quantity = max(
                         current_location_quantity - selected_location_admin_quantity, 0
@@ -2023,6 +2131,7 @@ def render(menu):
                         admin_unowned_company_stock_elsewhere,
                         total_personal_user_quantity,
                         total_written_off_quantity,
+                        total_net_sold_quantity,
                     )
                     max_for_selected_location = admin_capacity["available"]
                     location_quantity_label = "Quantity To Add"
@@ -2031,7 +2140,7 @@ def render(menu):
                         "Enter only the new quantity to add to the selected location."
                     )
 
-                    admin_qty_col1, admin_qty_col2, admin_qty_col3, admin_qty_col4, admin_qty_col5 = st.columns(5)
+                    admin_qty_col1, admin_qty_col2, admin_qty_col3, admin_qty_col4, admin_qty_col5, admin_qty_col6 = st.columns(6)
                     with admin_qty_col1:
                         st.markdown(
                             f"""
@@ -2080,6 +2189,17 @@ def render(menu):
                         st.markdown(
                             f"""
                             <div class="dashboard-card">
+                                <div class="dashboard-card-label">Net Sold</div>
+                                <div class="dashboard-card-value">{admin_net_sold_quantity}</div>
+                                <div class="dashboard-card-note">Sold units minus completed customer returns</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                    with admin_qty_col6:
+                        st.markdown(
+                            f"""
+                            <div class="dashboard-card">
                                 <div class="dashboard-card-label">My Quantity Here</div>
                                 <div class="dashboard-card-value">{current_admin_location_quantity}</div>
                                 <div class="dashboard-card-note">Your owned quantity at this selected location</div>
@@ -2098,11 +2218,11 @@ def render(menu):
                             f"{max_for_selected_location} unit(s) are currently available to add after "
                             "physical stock, user stock, and permanent write-offs are considered."
                         )
-                    elif admin_added_quantity + admin_written_off_quantity > admin_assigned_quantity:
+                    elif admin_added_quantity + admin_written_off_quantity + admin_net_sold_quantity > admin_assigned_quantity:
                         st.warning(
                             "You already added more quantity than Super Admin assigned to your admin account. "
                             f"Assigned To You is {admin_assigned_quantity}, Added By You is {admin_added_quantity}, "
-                            f"and Written Off is {admin_written_off_quantity}. "
+                            f"Written Off is {admin_written_off_quantity}, and Net Sold is {admin_net_sold_quantity}. "
                             "Super Admin should increase Assigned Quantity before more stock can be added."
                         )
 
@@ -2387,10 +2507,22 @@ def render(menu):
                             (item_code,)
                         )
                         locked_owner_written_off_total = int(c.fetchone()[0] or 0)
+                        locked_net_sold_total = get_net_sold_quantity(c, item_code)
+                        c.execute(
+                            '''SELECT DISTINCT username FROM admin_product_allocations
+                               WHERE LOWER(item_code)=LOWER(?)''',
+                            (item_code,)
+                        )
+                        locked_allocation_owners = [row[0] for row in c.fetchall()]
+                        locked_owner_net_sold_total = sum(
+                            get_net_sold_quantity(c, item_code, owner)
+                            for owner in locked_allocation_owners
+                        )
                         locked_admin_reserved = calculate_remaining_assignment(
                             locked_admin_assigned_total,
                             locked_admin_placed_total,
                             locked_owner_written_off_total,
+                            locked_owner_net_sold_total,
                         )
                         locked_selected_user_remaining = 0
                         locked_ownership_from_existing = 0
@@ -2416,10 +2548,14 @@ def render(menu):
                                 (item_code, selected_access_username)
                             )
                             locked_selected_user_written_off = int(c.fetchone()[0] or 0)
+                            locked_selected_user_sold = get_net_sold_quantity(
+                                c, item_code, selected_access_username
+                            )
                             locked_selected_user_remaining = calculate_remaining_assignment(
                                 locked_selected_user_assigned,
                                 locked_selected_user_placed,
                                 locked_selected_user_written_off,
+                                locked_selected_user_sold,
                             )
                             c.execute(
                                 '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -2451,6 +2587,7 @@ def render(menu):
                                 ),
                                 locked_personal_user_total,
                                 locked_written_off_total,
+                                locked_net_sold_total,
                             )
                             locked_company_available = locked_selected_capacity["available"]
                             locked_ownership_from_existing = min(
@@ -2463,7 +2600,8 @@ def render(menu):
                                 - locked_location_total
                                 - locked_personal_user_total
                                 - locked_admin_reserved
-                                - locked_written_off_total,
+                                - locked_written_off_total
+                                - locked_net_sold_total,
                                 0
                             )
                         if is_super_admin() and quantity_set > locked_company_available:
@@ -2502,10 +2640,14 @@ def render(menu):
                                 (item_code, st.session_state.username)
                             )
                             locked_admin_written_off = int(c.fetchone()[0] or 0)
+                            locked_admin_sold = get_net_sold_quantity(
+                                c, item_code, st.session_state.username
+                            )
                             locked_admin_available = calculate_remaining_assignment(
                                 locked_admin_assignment,
                                 locked_admin_added,
                                 locked_admin_written_off,
+                                locked_admin_sold,
                             )
                             c.execute(
                                 '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -2537,6 +2679,7 @@ def render(menu):
                                 ),
                                 locked_personal_user_total,
                                 locked_written_off_total,
+                                locked_net_sold_total,
                             )
                             locked_ownership_from_existing = min(
                                 quantity_set, locked_selected_capacity["unowned_at_location"]
@@ -2762,10 +2905,19 @@ def render(menu):
                    inv.customer_name, inv.created_by, inv.total,
                    COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id), 0) AS paid,
                    COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id), 0) AS credits,
+                   COALESCE((SELECT SUM(rf.amount) FROM refunds rf
+                             WHERE rf.invoice_id=inv.id AND rf.status='completed'),0) AS refunded,
                    MAX(inv.total
                        - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id), 0)
                        - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id), 0),0)
                        AS outstanding,
+                   MAX(
+                       COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
+                       + COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0)
+                       - inv.total
+                       - COALESCE((SELECT SUM(rf.amount) FROM refunds rf
+                                   WHERE rf.invoice_id=inv.id AND rf.status='completed'),0),0)
+                       AS refund_due,
                    inv.status, inv.created_at
             FROM invoices inv
             LEFT JOIN locations l ON inv.location_id = l.id
@@ -2836,11 +2988,12 @@ def render(menu):
 
         if "financial_page_mode" not in st.session_state:
             st.session_state.financial_page_mode = "overview"
-        financial_nav_cols = st.columns(4)
+        financial_nav_cols = st.columns(5)
         financial_nav_items = [
             ("Overview", "overview"),
             ("Create Invoice", "create_invoice"),
             ("Record Payment", "record_payment"),
+            ("Record Refund", "record_refund"),
             ("View Records", "view_records"),
         ]
         for nav_col, (nav_label, nav_mode) in zip(financial_nav_cols, financial_nav_items):
@@ -2864,8 +3017,10 @@ def render(menu):
         total_invoice_amount = float(summary_invoices_df["total"].sum()) if not summary_invoices_df.empty else 0
         total_paid = float(summary_invoices_df["paid"].sum()) if not summary_invoices_df.empty else 0
         total_credits = float(summary_invoices_df["credits"].sum()) if not summary_invoices_df.empty else 0
+        total_net_sales = total_invoice_amount - total_credits
+        total_refund_due = float(summary_invoices_df["refund_due"].sum()) if not summary_invoices_df.empty else 0
         total_outstanding = float(summary_invoices_df["outstanding"].sum()) if not summary_invoices_df.empty else 0
-        financial_col1, financial_col2, financial_col3, financial_col4 = st.columns(4)
+        financial_col1, financial_col2, financial_col3, financial_col4, financial_col5, financial_col6 = st.columns(6)
 
         with financial_col1:
             st.markdown(
@@ -2902,6 +3057,20 @@ def render(menu):
             )
         with financial_col4:
             st.markdown(
+                f"""<div class="dashboard-card"><div class="dashboard-card-label">Net Sales</div>
+                <div class="dashboard-card-value">${total_net_sales:,.2f}</div>
+                <div class="dashboard-card-note">Invoice total minus return credits</div></div>""",
+                unsafe_allow_html=True
+            )
+        with financial_col5:
+            st.markdown(
+                f"""<div class="dashboard-card"><div class="dashboard-card-label">Refund Due</div>
+                <div class="dashboard-card-value">${total_refund_due:,.2f}</div>
+                <div class="dashboard-card-note">Customer money still to refund</div></div>""",
+                unsafe_allow_html=True
+            )
+        with financial_col6:
+            st.markdown(
                 f"""
                 <div class="dashboard-card">
                     <div class="dashboard-card-label">Outstanding</div>
@@ -2937,6 +3106,7 @@ def render(menu):
 
         invoice_form_col = st.empty()
         payment_form_col = st.empty()
+        refund_form_col = st.empty()
 
         with invoice_form_col.container():
             st.markdown('<div class="dashboard-section-title">Create Invoice</div>', unsafe_allow_html=True)
@@ -3076,6 +3246,46 @@ def render(menu):
                     ].iloc[0]
                     available_quantity = int(selected_item_row["quantity"])
                     default_unit_price = float(selected_item_row["price"])
+                    invoice_affected_owner = None
+                    if is_super_admin():
+                        owner_conn = get_connection()
+                        try:
+                            invoice_owner_df = pd.read_sql_query(
+                                '''SELECT als.username,COALESCE(u.role,'unknown') AS role,
+                                          als.quantity AS owned_quantity
+                                   FROM admin_location_stock als
+                                   LEFT JOIN users u ON LOWER(u.username)=LOWER(als.username)
+                                   WHERE als.location_id=? AND LOWER(als.item_code)=LOWER(?)
+                                     AND als.quantity>0 ORDER BY u.role,als.username''',
+                                owner_conn,
+                                params=(location_id, item_code)
+                            )
+                        finally:
+                            owner_conn.close()
+                        total_owned_for_invoice = (
+                            int(invoice_owner_df["owned_quantity"].sum())
+                            if not invoice_owner_df.empty else 0
+                        )
+                        generic_for_invoice = max(available_quantity - total_owned_for_invoice, 0)
+                        owner_options = {"Unowned company stock only": (None, 0)}
+                        owner_options.update({
+                            f"{row['username']} ({str(row['role']).title()})": (
+                                str(row["username"]), int(row["owned_quantity"])
+                            ) for _, row in invoice_owner_df.iterrows()
+                        })
+                        selected_invoice_owner = st.selectbox(
+                            "Stock Owner Used by Invoice",
+                            list(owner_options.keys()),
+                            key=f"invoice_owner_{location_id}_{item_code}"
+                        )
+                        invoice_affected_owner, selected_owner_quantity = owner_options[selected_invoice_owner]
+                        available_quantity = min(
+                            available_quantity, generic_for_invoice + selected_owner_quantity
+                        )
+                        st.caption(
+                            f"Unowned stock: {generic_for_invoice}; selected owner stock: "
+                            f"{selected_owner_quantity}. The invoice cannot consume another user's stock."
+                        )
                     create_invoice = False
 
                     with st.container(border=True):
@@ -3267,9 +3477,9 @@ def render(menu):
                             else:
                                 unit_price = locked_location_price
                                 invoice_total = quantity_int * unit_price
-                                consume_invoice_location_ownership(
+                                consumed_owner_username = consume_invoice_location_ownership(
                                     c, get_current_role(), st.session_state.username,
-                                    location_id, item_code, quantity_int
+                                    location_id, item_code, quantity_int, invoice_affected_owner
                                 )
                                 c.execute(
                                     '''
@@ -3318,22 +3528,24 @@ def render(menu):
                                 c.execute(
                                     '''
                                     INSERT INTO invoice_items
-                                    (invoice_id,item_code,quantity,unit_price,line_total)
-                                    VALUES (?,?,?,?,?)
+                                    (invoice_id,item_code,quantity,unit_price,line_total,owner_username)
+                                    VALUES (?,?,?,?,?,?)
                                     ''',
                                     (
                                         invoice_id,
                                         item_code,
                                         quantity_int,
                                         unit_price,
-                                        invoice_total
+                                        invoice_total,
+                                        consumed_owner_username
                                     )
                                 )
                                 c.execute(
                                     '''
                                     INSERT INTO transactions
-                                    (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
-                                    VALUES (?,?,?,?,?,?,?,?,?)
+                                    (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,
+                                     source_type,location_id,transaction_time,affected_owner_username)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?)
                                     ''',
                                     (
                                         st.session_state.username,
@@ -3344,7 +3556,8 @@ def render(menu):
                                         "sale",
                                         "location_stock",
                                         location_id,
-                                        now
+                                        now,
+                                        consumed_owner_username
                                     )
                                 )
                                 conn.commit()
@@ -3438,15 +3651,101 @@ def render(menu):
                         finally:
                             conn.close()
 
+        with refund_form_col.container():
+            st.markdown('<div class="dashboard-section-title">Record Customer Refund</div>', unsafe_allow_html=True)
+            refundable_invoices_df = invoices_df[
+                ~invoices_df["status"].fillna("").astype(str).str.lower().isin(excluded_financial_statuses)
+                & (invoices_df["refund_due"].astype(float) > 0.005)
+            ].copy()
+            if refundable_invoices_df.empty:
+                st.info("No customer refunds are currently due for the invoices you can access.")
+            else:
+                refund_invoice_options = {
+                    f"{row['invoice_number']} - {row['customer_name']} (${float(row['refund_due']):,.2f} due)": int(row["id"])
+                    for _, row in refundable_invoices_df.iterrows()
+                }
+                with st.form("record_refund_form"):
+                    selected_refund_invoice = st.selectbox("Invoice", list(refund_invoice_options.keys()))
+                    refund_amount = st.number_input("Refund Amount", min_value=0.0, step=0.01, format="%.2f")
+                    refund_method = st.selectbox(
+                        "Refund Method", ["cash", "check", "wire", "credit_card", "store_credit"]
+                    )
+                    refund_reference = st.text_input("Refund Reference")
+                    record_refund = st.form_submit_button(
+                        "Record Refund", type="primary", width="stretch"
+                    )
+                if record_refund:
+                    if refund_amount <= 0:
+                        st.error("Refund amount must be greater than zero.")
+                    else:
+                        invoice_id = refund_invoice_options[selected_refund_invoice]
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        conn = get_connection()
+                        c = conn.cursor()
+                        try:
+                            c.execute("BEGIN IMMEDIATE")
+                            c.execute(
+                                '''SELECT inv.total,
+                                          COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0),
+                                          COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0),
+                                          COALESCE((SELECT SUM(rf.amount) FROM refunds rf
+                                                    WHERE rf.invoice_id=inv.id AND rf.status='completed'),0),
+                                          inv.status
+                                   FROM invoices inv WHERE inv.id=?''',
+                                (invoice_id,)
+                            )
+                            locked_refund_row = c.fetchone()
+                            if not locked_refund_row:
+                                raise ValueError("The selected invoice no longer exists.")
+                            total, paid, credits, already_refunded, invoice_status = locked_refund_row
+                            if str(invoice_status or "").lower() in excluded_financial_statuses:
+                                raise ValueError("A refund cannot be recorded for a void or cancelled invoice.")
+                            locked_refund_due = max(
+                                float(paid or 0) + float(credits or 0)
+                                - float(total or 0) - float(already_refunded or 0), 0.0
+                            )
+                            if float(refund_amount) > locked_refund_due + 0.005:
+                                raise ValueError(
+                                    f"Refund cannot exceed the current refund due of ${locked_refund_due:,.2f}."
+                                )
+                            c.execute(
+                                '''INSERT INTO refunds
+                                   (invoice_id,amount,refund_method,reference_number,status,processed_by,processed_at)
+                                   VALUES (?,?,?,?,?,?,?)''',
+                                (
+                                    invoice_id, float(refund_amount), refund_method,
+                                    refund_reference.strip(), "completed",
+                                    st.session_state.username, now,
+                                )
+                            )
+                            conn.commit()
+                            st.success("Customer refund recorded successfully.")
+                            st.rerun()
+                        except ValueError as exc:
+                            conn.rollback()
+                            st.error(str(exc))
+                        except sqlite3.Error as exc:
+                            conn.rollback()
+                            st.error(f"Refund could not be recorded: {exc}")
+                        finally:
+                            conn.close()
+
         if st.session_state.financial_page_mode == "create_invoice":
             payment_form_col.empty()
+            refund_form_col.empty()
             return
         if st.session_state.financial_page_mode == "record_payment":
             invoice_form_col.empty()
+            refund_form_col.empty()
+            return
+        if st.session_state.financial_page_mode == "record_refund":
+            invoice_form_col.empty()
+            payment_form_col.empty()
             return
 
         invoice_form_col.empty()
         payment_form_col.empty()
+        refund_form_col.empty()
         st.markdown('<div class="dashboard-section-title">Invoices</div>', unsafe_allow_html=True)
         if invoices_df.empty:
             st.info("No invoices have been created for the records you can access yet.")
@@ -3492,6 +3791,8 @@ def render(menu):
                 invoice_display_df["total_display"] = invoice_display_df["total"].apply(format_currency)
                 invoice_display_df["paid_display"] = invoice_display_df["paid"].apply(format_currency)
                 invoice_display_df["credits_display"] = invoice_display_df["credits"].apply(format_currency)
+                invoice_display_df["refunded_display"] = invoice_display_df["refunded"].apply(format_currency)
+                invoice_display_df["refund_due_display"] = invoice_display_df["refund_due"].apply(format_currency)
                 invoice_display_df["outstanding_display"] = invoice_display_df["outstanding"].apply(format_currency)
                 invoice_display_df = invoice_display_df[
                     [
@@ -3502,6 +3803,8 @@ def render(menu):
                         "total_display",
                         "paid_display",
                         "credits_display",
+                        "refunded_display",
+                        "refund_due_display",
                         "outstanding_display",
                         "balance_status",
                         "created_at",
@@ -3520,6 +3823,8 @@ def render(menu):
                     "total_display": "Total",
                     "paid_display": "Paid",
                     "credits_display": "Return Credits",
+                    "refunded_display": "Refunded",
+                    "refund_due_display": "Refund Due",
                     "outstanding_display": "Outstanding",
                     "balance_status": "Is Paid",
                     "created_at": "Created",
