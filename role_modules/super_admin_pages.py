@@ -11,6 +11,39 @@ def calculate_new_base_quantity(current_quantity, quantity_to_add):
     return current_quantity + quantity_to_add
 
 
+def calculate_available_product_assignment(base_quantity, total_assigned, generic_written_off=0):
+    """Return new reservation capacity after assignments and unowned permanent write-offs."""
+    return max(
+        int(base_quantity or 0)
+        - int(total_assigned or 0)
+        - int(generic_written_off or 0),
+        0,
+    )
+
+
+def get_generic_written_off_quantity(cursor, item_code):
+    """Return completed write-offs not charged to an Admin or Sales assignment."""
+    cursor.execute(
+        '''SELECT COALESCE(SUM(
+               CASE
+                   WHEN COALESCE(r.affected_owner_username,'')<>'' THEN 0
+                   WHEN EXISTS (
+                       SELECT 1 FROM users u
+                       WHERE LOWER(u.username)=LOWER(r.recorded_by)
+                         AND u.role IN ('admin','sales')
+                   ) THEN 0
+                   ELSE r.quantity
+               END
+           ),0)
+           FROM returns r
+           WHERE LOWER(r.item_code)=LOWER(?)
+             AND r.status='completed'
+             AND r.condition_status<>'customer_return' ''',
+        (item_code,)
+    )
+    return int(cursor.fetchone()[0] or 0)
+
+
 def create_inventory_entry(
     conn, item_code, item_name, description, quantity, cost, location_id, created_by, selling_price=0
 ):
@@ -175,7 +208,9 @@ def get_user_deletion_blockers(cursor, username):
     cursor.execute(
         '''SELECT COUNT(*) FROM invoices inv
            WHERE LOWER(COALESCE(inv.created_by,''))=LOWER(?)
-             AND inv.total-COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)>0''',
+             AND inv.total
+                 - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
+                 - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0)>0''',
         (username,)
     )
     open_invoices = int(cursor.fetchone()[0] or 0)
@@ -2019,6 +2054,15 @@ def render(menu):
                                      AND LOWER(als.item_code)=LOWER(ps.item_code)
                                ), 0), 0)
                        END AS added_quantity
+                       ,COALESCE((
+                           SELECT SUM(r.quantity)
+                           FROM returns r
+                           WHERE LOWER(r.item_code)=LOWER(ps.item_code)
+                             AND r.status='completed'
+                             AND r.condition_status<>'customer_return'
+                             AND LOWER(COALESCE(NULLIF(r.affected_owner_username,''),r.recorded_by))
+                                 =LOWER(ps.username)
+                       ),0) AS written_off_quantity
                 FROM product_suppliers ps
                 LEFT JOIN users u ON ps.username = u.username
                 LEFT JOIN inventory i ON ps.item_code = i.item_code
@@ -2037,14 +2081,19 @@ def render(menu):
                 product_assignments_df["added_quantity"] = pd.to_numeric(
                     product_assignments_df["added_quantity"], errors="coerce"
                 ).fillna(0).clip(lower=0).astype(int)
+                product_assignments_df["written_off_quantity"] = pd.to_numeric(
+                    product_assignments_df["written_off_quantity"], errors="coerce"
+                ).fillna(0).clip(lower=0).astype(int)
                 product_assignments_df["remaining_quantity"] = (
                     product_assignments_df["assigned_quantity"]
                     - product_assignments_df["added_quantity"]
+                    - product_assignments_df["written_off_quantity"]
                 ).clip(lower=0).astype(int)
                 product_assignments_df["assignment_status"] = product_assignments_df.apply(
                     lambda row: (
                         "Over assignment"
-                        if int(row["added_quantity"]) > int(row["assigned_quantity"])
+                        if int(row["added_quantity"]) + int(row["written_off_quantity"])
+                        > int(row["assigned_quantity"])
                         else "Available"
                         if int(row["remaining_quantity"]) > 0
                         else "Fully used"
@@ -2125,6 +2174,15 @@ def render(menu):
                         total_item_assigned_to_users = int(
                             item_assignment_rows["assigned_quantity"].fillna(0).sum()
                         )
+                    writeoff_conn = get_connection()
+                    try:
+                        generic_written_off_quantity = int(
+                            get_generic_written_off_quantity(
+                                writeoff_conn.cursor(), selected_supplier_item_code
+                            )
+                        )
+                    finally:
+                        writeoff_conn.close()
                     assigned_product_quantity = 0
                     if selected_supplier_user_role in {"admin", "sales", "user"}:
                         if "supplier_assignment_reset_counter" not in st.session_state:
@@ -2133,10 +2191,10 @@ def render(menu):
                             f"supplier_assignment_quantity_{supplier_username}_{selected_supplier_item_code}_"
                             f"{st.session_state.supplier_assignment_reset_counter}"
                         )
-                        available_supplier_assignment_quantity = max(
-                            selected_supplier_item_quantity
-                            - total_item_assigned_to_users,
-                            0
+                        available_supplier_assignment_quantity = calculate_available_product_assignment(
+                            selected_supplier_item_quantity,
+                            total_item_assigned_to_users,
+                            generic_written_off_quantity,
                         )
                         assigned_product_quantity = st.number_input(
                             "Quantity To Assign",
@@ -2154,6 +2212,7 @@ def render(menu):
                             f"Current {selected_supplier_user_role.replace('_', ' ').title()} assigned quantity: "
                             f"{current_supplier_assigned_quantity}. "
                             f"Assigned to all Admin, Sales, and Standard Users: {total_item_assigned_to_users}. "
+                            f"Unowned stock written off: {generic_written_off_quantity}. "
                             f"Item base quantity: {selected_supplier_item_quantity}. "
                             f"Available to assign: {available_supplier_assignment_quantity}. "
                             f"After save, this user will have "
@@ -2215,11 +2274,13 @@ def render(menu):
                                     if not locked_item_row:
                                         raise ValueError("The selected inventory item no longer exists.")
                                     locked_item_base_quantity = int(locked_item_row[0] or 0)
-                                    max_quantity_to_add = max(
-                                        locked_item_base_quantity
-                                        - assigned_to_other_users
-                                        - existing_assigned_quantity,
-                                        0
+                                    locked_generic_written_off = get_generic_written_off_quantity(
+                                        c, selected_supplier_item_code
+                                    )
+                                    max_quantity_to_add = calculate_available_product_assignment(
+                                        locked_item_base_quantity,
+                                        assigned_to_other_users + existing_assigned_quantity,
+                                        locked_generic_written_off,
                                     )
                                     if quantity_to_assign > max_quantity_to_add:
                                         st.error(
@@ -2227,6 +2288,7 @@ def render(menu):
                                             f"Item base quantity: {locked_item_base_quantity}; "
                                             f"this user already has: {existing_assigned_quantity}; "
                                             f"other assigned users have: {assigned_to_other_users}; "
+                                            f"unowned stock written off: {locked_generic_written_off}; "
                                             f"available to assign now: {max_quantity_to_add}."
                                         )
                                         conn.rollback()
@@ -2301,6 +2363,21 @@ def render(menu):
                                         f"{used_assignment_quantity} unit(s) added from it."
                                     )
                                 c.execute(
+                                    '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                       WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                         AND condition_status<>'customer_return'
+                                         AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                             =LOWER(?)''',
+                                    (supplier_item_options[supplier_item], supplier_username)
+                                )
+                                written_off_assignment_quantity = int(c.fetchone()[0] or 0)
+                                if written_off_assignment_quantity > 0:
+                                    raise ValueError(
+                                        "This product assignment cannot be removed because "
+                                        f"{written_off_assignment_quantity} unit(s) were permanently written off "
+                                        "against this user's assignment."
+                                    )
+                                c.execute(
                                     '''DELETE FROM product_suppliers
                                        WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
                                     (supplier_username, supplier_item_options[supplier_item])
@@ -2335,6 +2412,7 @@ def render(menu):
                                 "item_name": "Item Name",
                                 "assigned_quantity": "Assigned Quantity",
                                 "added_quantity": "Placed By User",
+                                "written_off_quantity": "Written Off / Damaged",
                                 "remaining_quantity": "Remaining Assignment",
                                 "assignment_status": "Assignment Status",
                             }

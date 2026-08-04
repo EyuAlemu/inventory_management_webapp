@@ -204,11 +204,14 @@ def get_item_delete_blockers(cursor, item_code):
 def get_invoice_balance(cursor, invoice_id):
     cursor.execute(
         '''
-        SELECT inv.total - COALESCE(SUM(p.amount), 0)
+        SELECT MAX(
+                   inv.total
+                   - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
+                   - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0),
+                   0
+               )
         FROM invoices inv
-        LEFT JOIN payments p ON p.invoice_id = inv.id
         WHERE inv.id=?
-        GROUP BY inv.id
         ''',
         (invoice_id,)
     )
@@ -2491,7 +2494,7 @@ else:
         nav_sections = [
             ("Operations", ["Dashboard", "Location Inventory", "Returns", "Transfers"]),
             ("Finance", ["Financials"]),
-            ("Setup", ["Locations", "User Management", "Add Inventory", "View Inventory", "Print QR Codes"]),
+            ("Setup", ["Locations", "Add Inventory", "User Management", "View Inventory", "Print QR Codes"]),
             ("Reports", ["Manage Sales", "Transaction Logs"]),
         ]
     elif get_current_role() == "admin":

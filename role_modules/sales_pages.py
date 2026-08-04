@@ -339,8 +339,12 @@ def render(menu):
                               COALESCE(inv.total,0) AS total,
                               COALESCE((SELECT SUM(p.amount)
                                         FROM payments p WHERE p.invoice_id=inv.id),0) AS paid,
-                              MAX(COALESCE(inv.total,0)-COALESCE((SELECT SUM(p.amount)
-                                        FROM payments p WHERE p.invoice_id=inv.id),0),0) AS balance,
+                              COALESCE((SELECT SUM(ic.amount)
+                                        FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0) AS credits,
+                              MAX(COALESCE(inv.total,0)
+                                  - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
+                                  - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0),0)
+                                  AS balance,
                               COALESCE((SELECT GROUP_CONCAT(DISTINCT p.payment_method)
                                         FROM payments p WHERE p.invoice_id=inv.id),'') AS payment_method,
                               COALESCE((SELECT GROUP_CONCAT(DISTINCT p.reference_number)
@@ -368,7 +372,9 @@ def render(menu):
                 st.info("You have not created any sales invoices for your assigned locations yet.")
             else:
                 sales_records_df["payment_status"] = sales_records_df.apply(
-                    lambda row: calculate_sales_payment_status(row["total"], row["paid"]),
+                    lambda row: calculate_sales_payment_status(
+                        max(float(row["total"]) - float(row["credits"]), 0), row["paid"]
+                    ),
                     axis=1,
                 )
 
@@ -417,7 +423,7 @@ def render(menu):
                 sales_display_df = sales_display_df[
                     [
                         "invoice_number", "location", "customer_name", "items", "quantity",
-                        "total", "paid", "balance", "payment_status", "payment_method",
+                        "total", "paid", "credits", "balance", "payment_status", "payment_method",
                         "payment_reference", "status", "created_at",
                     ]
                 ]
@@ -437,6 +443,7 @@ def render(menu):
                             "quantity": "Quantity",
                             "total": st.column_config.NumberColumn("Total", format="$%.2f"),
                             "paid": st.column_config.NumberColumn("Paid", format="$%.2f"),
+                            "credits": st.column_config.NumberColumn("Return Credits", format="$%.2f"),
                             "balance": st.column_config.NumberColumn("Balance", format="$%.2f"),
                             "payment_status": "Payment Status",
                             "payment_method": "Payment Method",

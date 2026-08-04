@@ -227,6 +227,19 @@ def init_db():
     ''')
 
     c.execute('''
+    CREATE TABLE IF NOT EXISTS invoice_credits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER NOT NULL,
+        return_id INTEGER,
+        amount REAL DEFAULT 0,
+        credit_type TEXT DEFAULT 'customer_return',
+        created_by TEXT,
+        created_at TEXT,
+        UNIQUE(return_id)
+    )
+    ''')
+
+    c.execute('''
     CREATE TABLE IF NOT EXISTS returns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         location_id INTEGER,
@@ -249,6 +262,8 @@ def init_db():
         c.execute("ALTER TABLE returns ADD COLUMN inventory_action TEXT")
     if "invoice_id" not in return_columns:
         c.execute("ALTER TABLE returns ADD COLUMN invoice_id INTEGER")
+    if "affected_owner_username" not in return_columns:
+        c.execute("ALTER TABLE returns ADD COLUMN affected_owner_username TEXT")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS inventory_transfers (

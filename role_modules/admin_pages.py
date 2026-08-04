@@ -21,15 +21,26 @@ def is_dashboard_usage_transaction(transaction_type):
     return str(transaction_type or "").strip().lower() == "sale"
 
 
+def calculate_remaining_assignment(assigned_quantity, placed_quantity, written_off_quantity=0):
+    """Return reservation still usable after placed and permanently written-off units."""
+    return max(
+        int(assigned_quantity or 0)
+        - int(placed_quantity or 0)
+        - int(written_off_quantity or 0),
+        0,
+    )
+
+
 def calculate_admin_location_capacity(
     base_quantity, total_location_quantity, selected_location_quantity,
     selected_location_admin_owned, selected_admin_remaining, unowned_elsewhere=0,
-    personal_user_quantity=0,
+    personal_user_quantity=0, written_off_quantity=0,
 ):
     """Return assignable ownership, existing stock used, and physical stock that may be added."""
     unowned_at_location = max(int(selected_location_quantity) - int(selected_location_admin_owned), 0)
     unlocated_company_stock = max(
-        int(base_quantity) - int(total_location_quantity) - int(personal_user_quantity),
+        int(base_quantity) - int(total_location_quantity) - int(personal_user_quantity)
+        - int(written_off_quantity),
         0,
     )
     available = min(
@@ -112,12 +123,14 @@ def consume_invoice_location_ownership(cursor, role, username, location_id, item
 
 
 def record_return_stock(
-    conn, username, role, location_id, item_code, quantity, reason, condition_status, invoice_id=None
+    conn, username, role, location_id, item_code, quantity, reason, condition_status,
+    invoice_id=None, affected_owner_username=None,
 ):
     """Apply a completed return/damage transaction and return its stock impact."""
     quantity = int(quantity)
     reason = str(reason or "").strip()
-    is_customer_return = condition_status == "customer_return"
+    is_customer_return = str(condition_status or "").startswith("customer_return")
+    is_sellable_customer_return = condition_status == "customer_return"
     if quantity <= 0:
         raise ValueError("Quantity must be greater than zero.")
     if not reason:
@@ -139,7 +152,8 @@ def record_return_stock(
             if invoice_id is None:
                 raise ValueError("Select the customer invoice associated with this return.")
             c.execute(
-                '''SELECT COALESCE(SUM(ii.quantity),0), inv.created_by
+                '''SELECT COALESCE(SUM(ii.quantity),0), inv.created_by,
+                          COALESCE(SUM(ii.line_total),0)
                    FROM invoice_items ii JOIN invoices inv ON inv.id=ii.invoice_id
                    WHERE inv.id=? AND inv.location_id=? AND LOWER(ii.item_code)=LOWER(?)
                      AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')
@@ -151,12 +165,14 @@ def record_return_stock(
                 raise ValueError("Only 0 can be returned for the selected invoice and item.")
             sold_quantity = int(invoice_row[0] or 0) if invoice_row else 0
             invoice_creator = str(invoice_row[1] or "") if invoice_row else ""
+            sold_line_total = float(invoice_row[2] or 0) if invoice_row else 0.0
             if role in {"admin", "sales"} and invoice_creator.lower() != str(username).lower():
                 raise ValueError("You can only receive returns for invoices you created.")
             c.execute(
                 '''SELECT COALESCE(SUM(quantity),0) FROM returns
                    WHERE invoice_id=? AND location_id=? AND LOWER(item_code)=LOWER(?)
-                     AND condition_status='customer_return' AND status='completed' ''',
+                     AND condition_status IN ('customer_return','customer_return_damaged')
+                     AND status='completed' ''',
                 (invoice_id, location_id, item_code)
             )
             returned_quantity = int(c.fetchone()[0] or 0)
@@ -166,10 +182,10 @@ def record_return_stock(
                     f"Only {returnable_quantity} can be returned: {sold_quantity} sold minus "
                     f"{returned_quantity} already returned."
                 )
-            quantity_after = quantity_before + quantity
-            quantity_change = quantity
-            inventory_action = "add"
-            action_type = "Customer Return"
+            quantity_after = quantity_before + quantity if is_sellable_customer_return else quantity_before
+            quantity_change = quantity if is_sellable_customer_return else 0
+            inventory_action = "add" if is_sellable_customer_return else "write_off_return"
+            action_type = "Customer Return" if is_sellable_customer_return else "Damaged Customer Return"
             if role in {"admin", "sales"}:
                 c.execute(
                     '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
@@ -184,21 +200,35 @@ def record_return_stock(
                     (username, item_code)
                 )
                 owned_total = int(c.fetchone()[0] or 0)
-                if quantity > max(assigned_quantity - owned_total, 0):
-                    raise ValueError("This return exceeds your available item assignment.")
-            c.execute(
-                '''INSERT INTO location_inventory (location_id,item_code,quantity)
-                   VALUES (?,?,?) ON CONFLICT(location_id,item_code)
-                   DO UPDATE SET quantity=excluded.quantity''',
-                (location_id, item_code, quantity_after)
-            )
-            if role in {"admin", "sales"}:
                 c.execute(
-                    '''INSERT INTO admin_location_stock (username,location_id,item_code,quantity)
-                       VALUES (?,?,?,?) ON CONFLICT(username,location_id,item_code)
-                       DO UPDATE SET quantity=admin_location_stock.quantity+excluded.quantity''',
-                    (username, location_id, item_code, quantity)
+                    '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                       WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                         AND condition_status<>'customer_return'
+                         AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                             =LOWER(?)''',
+                    (item_code, username)
                 )
+                written_off_total = int(c.fetchone()[0] or 0)
+                if quantity > calculate_remaining_assignment(
+                    assigned_quantity, owned_total, written_off_total
+                ):
+                    raise ValueError("This return exceeds your available item assignment.")
+            if is_sellable_customer_return:
+                c.execute(
+                    '''INSERT INTO location_inventory (location_id,item_code,quantity)
+                       VALUES (?,?,?) ON CONFLICT(location_id,item_code)
+                       DO UPDATE SET quantity=excluded.quantity''',
+                    (location_id, item_code, quantity_after)
+                )
+                if role in {"admin", "sales"}:
+                    c.execute(
+                        '''INSERT INTO admin_location_stock (username,location_id,item_code,quantity)
+                           VALUES (?,?,?,?) ON CONFLICT(username,location_id,item_code)
+                           DO UPDATE SET quantity=admin_location_stock.quantity+excluded.quantity''',
+                        (username, location_id, item_code, quantity)
+                    )
+            elif role in {"admin", "sales"}:
+                affected_owner_username = username
         else:
             if role == "sales":
                 raise ValueError("Sales users cannot record damaged or unsellable stock.")
@@ -228,6 +258,7 @@ def record_return_stock(
                        WHERE LOWER(username)=LOWER(?) AND location_id=? AND LOWER(item_code)=LOWER(?)''',
                     (quantity, username, location_id, item_code)
                 )
+                affected_owner_username = username
             else:
                 c.execute(
                     '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -237,30 +268,65 @@ def record_return_stock(
                 total_owned = int(c.fetchone()[0] or 0)
                 generic_quantity = max(quantity_before - total_owned, 0)
                 remaining = max(quantity - generic_quantity, 0)
-                c.execute(
-                    '''SELECT username,quantity FROM admin_location_stock
-                       WHERE location_id=? AND LOWER(item_code)=LOWER(?) AND quantity>0 ORDER BY id''',
-                    (location_id, item_code)
-                )
-                for owner, owner_quantity in c.fetchall():
-                    reduction = min(remaining, int(owner_quantity or 0))
-                    if reduction:
-                        c.execute(
-                            '''UPDATE admin_location_stock SET quantity=quantity-?
-                               WHERE LOWER(username)=LOWER(?) AND location_id=? AND LOWER(item_code)=LOWER(?)''',
-                            (reduction, owner, location_id, item_code)
+                if remaining > 0:
+                    if not str(affected_owner_username or "").strip():
+                        raise ValueError(
+                            "Select the Admin or Sales owner whose assigned stock was damaged."
                         )
-                        remaining -= reduction
-                    if remaining <= 0:
-                        break
+                    c.execute(
+                        '''SELECT COALESCE(quantity,0) FROM admin_location_stock
+                           WHERE LOWER(username)=LOWER(?) AND location_id=?
+                             AND LOWER(item_code)=LOWER(?)''',
+                        (affected_owner_username, location_id, item_code)
+                    )
+                    owner_row = c.fetchone()
+                    owner_quantity = int(owner_row[0] or 0) if owner_row else 0
+                    if remaining > owner_quantity:
+                        raise ValueError(
+                            f"Only {generic_quantity} unowned and {owner_quantity} owned by "
+                            f"{affected_owner_username} are available for this damage record."
+                        )
+                    c.execute(
+                        '''UPDATE admin_location_stock SET quantity=quantity-?
+                           WHERE LOWER(username)=LOWER(?) AND location_id=?
+                             AND LOWER(item_code)=LOWER(?)''',
+                        (remaining, affected_owner_username, location_id, item_code)
+                    )
+                else:
+                    affected_owner_username = None
 
         c.execute(
             '''INSERT INTO returns
                (location_id,item_code,quantity,reason,condition_status,recorded_by,status,created_at,
-                quantity_before,quantity_after,inventory_action,invoice_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                quantity_before,quantity_after,inventory_action,invoice_id,affected_owner_username)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (location_id, item_code, quantity, reason, condition_status, username, "completed", now,
-             quantity_before, quantity_after, inventory_action, invoice_id)
+             quantity_before, quantity_after, inventory_action, invoice_id, affected_owner_username)
         )
+        return_id = c.lastrowid
+        if is_customer_return:
+            credit_amount = round(
+                (sold_line_total / sold_quantity) * quantity if sold_quantity > 0 else 0,
+                2,
+            )
+            c.execute(
+                '''INSERT INTO invoice_credits
+                   (invoice_id,return_id,amount,credit_type,created_by,created_at)
+                   VALUES (?,?,?,?,?,?)''',
+                (invoice_id, return_id, credit_amount, "customer_return", username, now)
+            )
+            c.execute(
+                '''SELECT MAX(inv.total
+                              - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
+                              - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0),0)
+                   FROM invoices inv WHERE inv.id=?''',
+                (invoice_id,)
+            )
+            return_balance = float(c.fetchone()[0] or 0)
+            c.execute(
+                "UPDATE invoices SET status=? WHERE id=?",
+                ("paid" if return_balance <= 0.005 else "open", invoice_id)
+            )
         c.execute(
             '''INSERT INTO location_stock_history
                (location_id,item_code,quantity_before,quantity_set,quantity_after,action_type,updated_by,updated_at)
@@ -288,6 +354,9 @@ def render_returns_damage_records(returns_df):
     if returns_df.empty:
         st.info("No returned or damaged items have been recorded for the records you can access yet.")
         return
+    if "affected_owner_username" not in returns_df.columns:
+        returns_df = returns_df.copy()
+        returns_df["affected_owner_username"] = ""
 
     return_filter_columns = st.columns(3 if is_super_admin() else 2)
     return_filter_col1, return_filter_col2 = return_filter_columns[:2]
@@ -355,7 +424,8 @@ def render_returns_damage_records(returns_df):
             [
                 "invoice_id", "invoice_number", "invoice_created_by", "location", "item_code", "item_name",
                 "quantity_before", "quantity", "quantity_after", "inventory_action",
-                "condition_status", "status", "recorded_by", "created_at", "reason",
+                "condition_status", "affected_owner_username", "status", "recorded_by",
+                "created_at", "reason",
             ]
         ]
     else:
@@ -379,6 +449,7 @@ def render_returns_damage_records(returns_df):
             "quantity": "Quantity",
             "reason": "Reason",
             "condition_status": "Condition",
+            "affected_owner_username": "Affected Stock Owner",
             "recorded_by": "Recorded By",
             "status": "Status",
             "created_at": "Created",
@@ -610,6 +681,15 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             conn,
             params=(st.session_state.get("username", ""),)
         )
+        admin_written_off_df = pd.read_sql_query(
+            '''SELECT item_code, SUM(quantity) AS written_off
+               FROM returns
+               WHERE status='completed' AND condition_status<>'customer_return'
+                 AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)
+               GROUP BY LOWER(item_code)''',
+            conn,
+            params=(st.session_state.get("username", ""),)
+        )
         conn.close()
         if not admin_stock_history_df.empty:
             allowed_history_df = admin_stock_history_df.copy()
@@ -638,12 +718,20 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             )
             for _, row in inventory_df.iterrows()
         }
+        admin_written_off_by_item = (
+            admin_written_off_df.set_index("item_code")["written_off"]
+            .fillna(0).astype(int).to_dict()
+            if not admin_written_off_df.empty else {}
+        )
         stock_display_df["assigned_by_ruth"] = (
             stock_display_df["item_code"].map(assigned_by_ruth_by_item).fillna(0).astype(int)
         )
         stock_display_df["quantity_added_by_admin"] = (
             stock_display_df["item_code"].map(admin_added_by_item).fillna(0).astype(int)
         ).clip(lower=0).astype(int)
+        stock_display_df["written_off_by_admin"] = (
+            stock_display_df["item_code"].map(admin_written_off_by_item).fillna(0).astype(int)
+        )
         stock_display_df["my_quantity_here"] = stock_display_df.apply(
             lambda row: int(
                 admin_added_by_location_item.get(
@@ -655,12 +743,15 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
         )
         stock_display_df["stock_status"] = stock_display_df["my_quantity_here"].apply(stock_status)
         stock_display_df["available_to_add"] = (
-            stock_display_df["assigned_by_ruth"] - stock_display_df["quantity_added_by_admin"]
+            stock_display_df["assigned_by_ruth"]
+            - stock_display_df["quantity_added_by_admin"]
+            - stock_display_df["written_off_by_admin"]
         ).clip(lower=0).astype(int)
         stock_display_df["assignment_status"] = stock_display_df.apply(
             lambda row: (
                 "Needs Super Admin Increase"
-                if int(row["quantity_added_by_admin"]) > int(row["assigned_by_ruth"])
+                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"])
+                > int(row["assigned_by_ruth"])
                 else "Available"
                 if int(row["available_to_add"]) > 0
                 else "Fully Assigned"
@@ -674,14 +765,19 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
         assignment_summary_df["quantity_added_by_admin"] = (
             assignment_summary_df["item_code"].map(admin_added_by_item).fillna(0).astype(int)
         )
+        assignment_summary_df["written_off_by_admin"] = (
+            assignment_summary_df["item_code"].map(admin_written_off_by_item).fillna(0).astype(int)
+        )
         assignment_summary_df["available_to_add"] = (
             assignment_summary_df["assigned_by_ruth"]
             - assignment_summary_df["quantity_added_by_admin"]
+            - assignment_summary_df["written_off_by_admin"]
         ).clip(lower=0).astype(int)
         assignment_summary_df["assignment_status"] = assignment_summary_df.apply(
             lambda row: (
                 "Over assignment"
-                if int(row["quantity_added_by_admin"]) > int(row["assigned_by_ruth"])
+                if int(row["quantity_added_by_admin"]) + int(row["written_off_by_admin"])
+                > int(row["assigned_by_ruth"])
                 else "Available"
                 if int(row["available_to_add"]) > 0
                 else "Fully used"
@@ -698,6 +794,7 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
                 "item_name": "Item Name",
                 "assigned_by_ruth": "Assigned To You",
                 "quantity_added_by_admin": "Added By You",
+                "written_off_by_admin": "Written Off / Damaged",
                 "available_to_add": "Remaining Assignment",
                 "assignment_status": "Assignment Status",
             }
@@ -752,6 +849,20 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             ''',
             conn
         )
+        user_stock_df = pd.read_sql_query(
+            '''SELECT item_code, SUM(quantity) AS user_stock
+               FROM user_inventory GROUP BY LOWER(item_code)''',
+            conn
+        )
+        written_off_df = pd.read_sql_query(
+            '''SELECT item_code, SUM(quantity) AS written_off,
+                      SUM(CASE WHEN COALESCE(affected_owner_username,'')<>''
+                               THEN quantity ELSE 0 END) AS owner_written_off
+               FROM returns
+               WHERE status='completed' AND condition_status<>'customer_return'
+               GROUP BY LOWER(item_code)''',
+            conn
+        )
         conn.close()
         admin_allocated_by_item = (
             admin_allocation_df.assign(
@@ -767,6 +878,24 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             if not admin_placed_df.empty
             else {}
         )
+        user_stock_by_item = (
+            user_stock_df.assign(
+                item_code_key=user_stock_df["item_code"].astype(str).str.lower()
+            ).set_index("item_code_key")["user_stock"].fillna(0).astype(int).to_dict()
+            if not user_stock_df.empty else {}
+        )
+        written_off_by_item = (
+            written_off_df.assign(
+                item_code_key=written_off_df["item_code"].astype(str).str.lower()
+            ).set_index("item_code_key")["written_off"].fillna(0).astype(int).to_dict()
+            if not written_off_df.empty else {}
+        )
+        owner_written_off_by_item = (
+            written_off_df.assign(
+                item_code_key=written_off_df["item_code"].astype(str).str.lower()
+            ).set_index("item_code_key")["owner_written_off"].fillna(0).astype(int).to_dict()
+            if not written_off_df.empty else {}
+        )
         stock_display_df["item_code_key"] = stock_display_df["item_code"].astype(str).str.lower()
         stock_display_df["base_quantity"] = (
             stock_display_df["item_code"].map(base_quantity_by_item).fillna(0).astype(int)
@@ -780,13 +909,25 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
         stock_display_df["placed_by_admins"] = (
             stock_display_df["item_code_key"].map(admin_placed_by_item).fillna(0).astype(int)
         )
+        stock_display_df["user_stock"] = (
+            stock_display_df["item_code_key"].map(user_stock_by_item).fillna(0).astype(int)
+        )
+        stock_display_df["written_off"] = (
+            stock_display_df["item_code_key"].map(written_off_by_item).fillna(0).astype(int)
+        )
+        stock_display_df["owner_written_off"] = (
+            stock_display_df["item_code_key"].map(owner_written_off_by_item).fillna(0).astype(int)
+        )
         stock_display_df["admin_reserved_remaining"] = (
             stock_display_df["assigned_to_admins"] - stock_display_df["placed_by_admins"]
+            - stock_display_df["owner_written_off"]
         ).clip(lower=0).astype(int)
         stock_display_df["available_quantity"] = (
             stock_display_df["base_quantity"]
             - stock_display_df["assigned_quantity"]
+            - stock_display_df["user_stock"]
             - stock_display_df["admin_reserved_remaining"]
+            - stock_display_df["written_off"]
         ).astype(int)
         stock_display_df["quantity_integrity"] = stock_display_df["available_quantity"].apply(
             lambda available: "Over-allocated" if int(available) < 0 else "Valid"
@@ -809,6 +950,8 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
                 "assigned_quantity",
                 "assigned_to_admins",
                 "placed_by_admins",
+                "user_stock",
+                "written_off",
                 "admin_reserved_remaining",
                 "available_quantity",
                 "quantity_integrity",
@@ -839,6 +982,8 @@ def render_location_stock_table(location_stock_df, inventory_df, table_key_suffi
             "assigned_quantity": "Total In Locations",
             "assigned_to_admins": "Assigned To Admins",
             "placed_by_admins": "Placed By Admins",
+            "user_stock": "Standard User Stock",
+            "written_off": "Written Off / Damaged",
             "admin_reserved_remaining": "Admin Reserved Remaining",
             "available_quantity": "Available To Super Admin",
             "quantity_integrity": "Quantity Integrity",
@@ -1643,6 +1788,21 @@ def render(menu):
                 )
                 total_personal_user_quantity = int(c.fetchone()[0] or 0)
                 c.execute(
+                    '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                       WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                         AND condition_status<>'customer_return' ''',
+                    (item_code,)
+                )
+                total_written_off_quantity = int(c.fetchone()[0] or 0)
+                c.execute(
+                    '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                       WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                         AND condition_status<>'customer_return'
+                         AND COALESCE(affected_owner_username,'')<>'' ''',
+                    (item_code,)
+                )
+                total_owner_written_off_quantity = int(c.fetchone()[0] or 0)
+                c.execute(
                     '''
                     SELECT DISTINCT u.username, u.role
                     FROM users u
@@ -1666,15 +1826,17 @@ def render(menu):
                     else 0.0
                 )
                 all_assigned_quantity = int(all_item_stock_rows["quantity"].sum())
-                admin_reserved_remaining = max(
-                    total_admin_assigned_quantity - total_admin_placed_quantity,
-                    0
+                admin_reserved_remaining = calculate_remaining_assignment(
+                    total_admin_assigned_quantity,
+                    total_admin_placed_quantity,
+                    total_owner_written_off_quantity,
                 )
                 unassigned_quantity = max(
                     selected_base_quantity
                     - all_assigned_quantity
                     - total_personal_user_quantity
-                    - admin_reserved_remaining,
+                    - admin_reserved_remaining
+                    - total_written_off_quantity,
                     0
                 )
                 admin_assigned_quantity = (
@@ -1687,6 +1849,7 @@ def render(menu):
                 selected_user_assigned_quantity = 0
                 selected_user_placed_quantity = 0
                 selected_user_location_quantity = 0
+                selected_user_written_off_quantity = 0
                 selected_user_reserved_remaining = 0
                 if is_super_admin() and assigned_user_rows:
                     assigned_user_options = {
@@ -1723,9 +1886,20 @@ def render(menu):
                                 (selected_access_username, location_id, item_code)
                             ).fetchone()[0] or 0
                         )
-                        selected_user_reserved_remaining = max(
-                            selected_user_assigned_quantity - selected_user_placed_quantity,
-                            0
+                        selected_user_written_off_quantity = int(
+                            conn.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                   WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                     AND condition_status<>'customer_return'
+                                     AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                         =LOWER(?)''',
+                                (item_code, selected_access_username)
+                            ).fetchone()[0] or 0
+                        )
+                        selected_user_reserved_remaining = calculate_remaining_assignment(
+                            selected_user_assigned_quantity,
+                            selected_user_placed_quantity,
+                            selected_user_written_off_quantity,
                         )
                     conn.close()
                 if selected_access_role in {"admin", "sales"}:
@@ -1733,12 +1907,14 @@ def render(menu):
                         f"{safe_html(selected_access_username)} · {selected_access_role.title()}; "
                         f"{selected_user_placed_quantity} placed total, "
                         f"{selected_user_location_quantity} here, "
+                        f"{selected_user_written_off_quantity} written off, "
                         f"{selected_user_reserved_remaining} reserved"
                     )
                 else:
                     selected_user_assignment_note = "No assigned user for this location and product"
                 admin_added_quantity = 0
                 current_admin_location_quantity = 0
+                admin_written_off_quantity = 0
                 if not is_super_admin():
                     conn = get_connection()
                     admin_stock_history_totals = pd.read_sql_query(
@@ -1761,6 +1937,16 @@ def render(menu):
                                WHERE LOWER(username)=LOWER(?) AND location_id=?
                                  AND LOWER(item_code)=LOWER(?)''',
                             (st.session_state.username, location_id, item_code)
+                        ).fetchone()[0] or 0
+                    )
+                    admin_written_off_quantity = int(
+                        conn.execute(
+                            '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                               WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                 AND condition_status<>'customer_return'
+                                 AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                     =LOWER(?)''',
+                            (item_code, st.session_state.username)
                         ).fetchone()[0] or 0
                     )
                     conn.close()
@@ -1793,6 +1979,7 @@ def render(menu):
                             selected_user_reserved_remaining,
                             unowned_company_stock_elsewhere,
                             total_personal_user_quantity,
+                            total_written_off_quantity,
                         )
                         max_for_selected_location = selected_admin_capacity["available"]
                     else:
@@ -1813,9 +2000,10 @@ def render(menu):
                         )
                     )
                 else:
-                    admin_available_from_assignment = max(
-                        admin_assigned_quantity - admin_added_quantity,
-                        0
+                    admin_available_from_assignment = calculate_remaining_assignment(
+                        admin_assigned_quantity,
+                        admin_added_quantity,
+                        admin_written_off_quantity,
                     )
                     admin_location_unowned_quantity = max(
                         current_location_quantity - selected_location_admin_quantity, 0
@@ -1834,6 +2022,7 @@ def render(menu):
                         admin_available_from_assignment,
                         admin_unowned_company_stock_elsewhere,
                         total_personal_user_quantity,
+                        total_written_off_quantity,
                     )
                     max_for_selected_location = admin_capacity["available"]
                     location_quantity_label = "Quantity To Add"
@@ -1842,7 +2031,7 @@ def render(menu):
                         "Enter only the new quantity to add to the selected location."
                     )
 
-                    admin_qty_col1, admin_qty_col2, admin_qty_col3, admin_qty_col4 = st.columns(4)
+                    admin_qty_col1, admin_qty_col2, admin_qty_col3, admin_qty_col4, admin_qty_col5 = st.columns(5)
                     with admin_qty_col1:
                         st.markdown(
                             f"""
@@ -1860,7 +2049,7 @@ def render(menu):
                             <div class="dashboard-card">
                                 <div class="dashboard-card-label">Added By You</div>
                                 <div class="dashboard-card-value">{admin_added_quantity}</div>
-                                <div class="dashboard-card-note">Stock quantity you already added to assigned locations</div>
+                                <div class="dashboard-card-note">Current stock you own across assigned locations</div>
                             </div>
                             """,
                             unsafe_allow_html=True
@@ -1870,13 +2059,24 @@ def render(menu):
                             f"""
                             <div class="dashboard-card">
                                 <div class="dashboard-card-label">Your Available Assignment</div>
-                                <div class="dashboard-card-value">{admin_available_from_assignment}</div>
-                                <div class="dashboard-card-note">Assigned To You minus Added By You</div>
+                                <div class="dashboard-card-value">{max_for_selected_location}</div>
+                                <div class="dashboard-card-note">Usable now; {admin_available_from_assignment} reservation remaining before company-stock limits</div>
                             </div>
                             """,
                             unsafe_allow_html=True
                         )
                     with admin_qty_col4:
+                        st.markdown(
+                            f"""
+                            <div class="dashboard-card">
+                                <div class="dashboard-card-label">Written Off / Damaged</div>
+                                <div class="dashboard-card-value">{admin_written_off_quantity}</div>
+                                <div class="dashboard-card-note">Permanent item loss charged to your assignment</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                    with admin_qty_col5:
                         st.markdown(
                             f"""
                             <div class="dashboard-card">
@@ -1892,10 +2092,17 @@ def render(menu):
                             "This product is assigned to your admin account, but no quantity has been assigned to you yet. "
                             "Super Admin needs to assign a quantity before you can add stock to a location."
                         )
-                    elif admin_added_quantity > admin_assigned_quantity:
+                    elif max_for_selected_location < admin_available_from_assignment:
+                        st.info(
+                            f"Your remaining reservation is {admin_available_from_assignment}, but only "
+                            f"{max_for_selected_location} unit(s) are currently available to add after "
+                            "physical stock, user stock, and permanent write-offs are considered."
+                        )
+                    elif admin_added_quantity + admin_written_off_quantity > admin_assigned_quantity:
                         st.warning(
                             "You already added more quantity than Super Admin assigned to your admin account. "
-                            f"Assigned To You is {admin_assigned_quantity}, but Added By You is {admin_added_quantity}. "
+                            f"Assigned To You is {admin_assigned_quantity}, Added By You is {admin_added_quantity}, "
+                            f"and Written Off is {admin_written_off_quantity}. "
                             "Super Admin should increase Assigned Quantity before more stock can be added."
                         )
 
@@ -2121,11 +2328,14 @@ def render(menu):
                         not is_super_admin()
                         and int(location_quantity) > max_for_selected_location
                     ):
-                        required_admin_assignment = admin_added_quantity + int(location_quantity)
+                        required_admin_assignment = (
+                            admin_added_quantity + admin_written_off_quantity + int(location_quantity)
+                        )
                         st.error(
                             "Quantity To Add cannot be greater than the quantity assigned to you in Users & Access. "
                             f"Assigned to you: {admin_assigned_quantity}; added by you: "
-                            f"{admin_added_quantity}; your available assignment: "
+                            f"{admin_added_quantity}; written off: {admin_written_off_quantity}; "
+                            f"your available assignment: "
                             f"{max_for_selected_location}. "
                             f"Ask Super Admin to increase Assigned Quantity to at least {required_admin_assignment}."
                         )
@@ -2162,9 +2372,25 @@ def render(menu):
                             (item_code,)
                         )
                         locked_personal_user_total = int(c.fetchone()[0] or 0)
-                        locked_admin_reserved = max(
-                            locked_admin_assigned_total - locked_admin_placed_total,
-                            0
+                        c.execute(
+                            '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                               WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                 AND condition_status<>'customer_return' ''',
+                            (item_code,)
+                        )
+                        locked_written_off_total = int(c.fetchone()[0] or 0)
+                        c.execute(
+                            '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                               WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                 AND condition_status<>'customer_return'
+                                 AND COALESCE(affected_owner_username,'')<>'' ''',
+                            (item_code,)
+                        )
+                        locked_owner_written_off_total = int(c.fetchone()[0] or 0)
+                        locked_admin_reserved = calculate_remaining_assignment(
+                            locked_admin_assigned_total,
+                            locked_admin_placed_total,
+                            locked_owner_written_off_total,
                         )
                         locked_selected_user_remaining = 0
                         locked_ownership_from_existing = 0
@@ -2181,9 +2407,19 @@ def render(menu):
                                 (selected_access_username, item_code)
                             )
                             locked_selected_user_placed = int(c.fetchone()[0] or 0)
-                            locked_selected_user_remaining = max(
-                                locked_selected_user_assigned - locked_selected_user_placed,
-                                0
+                            c.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                   WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                     AND condition_status<>'customer_return'
+                                     AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                         =LOWER(?)''',
+                                (item_code, selected_access_username)
+                            )
+                            locked_selected_user_written_off = int(c.fetchone()[0] or 0)
+                            locked_selected_user_remaining = calculate_remaining_assignment(
+                                locked_selected_user_assigned,
+                                locked_selected_user_placed,
+                                locked_selected_user_written_off,
                             )
                             c.execute(
                                 '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -2214,6 +2450,7 @@ def render(menu):
                                     0
                                 ),
                                 locked_personal_user_total,
+                                locked_written_off_total,
                             )
                             locked_company_available = locked_selected_capacity["available"]
                             locked_ownership_from_existing = min(
@@ -2225,7 +2462,8 @@ def render(menu):
                                 locked_base_quantity
                                 - locked_location_total
                                 - locked_personal_user_total
-                                - locked_admin_reserved,
+                                - locked_admin_reserved
+                                - locked_written_off_total,
                                 0
                             )
                         if is_super_admin() and quantity_set > locked_company_available:
@@ -2255,9 +2493,19 @@ def render(menu):
                                 (st.session_state.username, item_code)
                             )
                             locked_admin_added = int(c.fetchone()[0] or 0)
-                            locked_admin_available = max(
-                                locked_admin_assignment - locked_admin_added,
-                                0
+                            c.execute(
+                                '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                   WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                     AND condition_status<>'customer_return'
+                                     AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                         =LOWER(?)''',
+                                (item_code, st.session_state.username)
+                            )
+                            locked_admin_written_off = int(c.fetchone()[0] or 0)
+                            locked_admin_available = calculate_remaining_assignment(
+                                locked_admin_assignment,
+                                locked_admin_added,
+                                locked_admin_written_off,
                             )
                             c.execute(
                                 '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -2288,6 +2536,7 @@ def render(menu):
                                     0
                                 ),
                                 locked_personal_user_total,
+                                locked_written_off_total,
                             )
                             locked_ownership_from_existing = min(
                                 quantity_set, locked_selected_capacity["unowned_at_location"]
@@ -2512,7 +2761,11 @@ def render(menu):
                     WHERE ii.invoice_id=inv.id) AS item_codes,
                    inv.customer_name, inv.created_by, inv.total,
                    COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id), 0) AS paid,
-                   inv.total - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id), 0) AS outstanding,
+                   COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id), 0) AS credits,
+                   MAX(inv.total
+                       - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id), 0)
+                       - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id), 0),0)
+                       AS outstanding,
                    inv.status, inv.created_at
             FROM invoices inv
             LEFT JOIN locations l ON inv.location_id = l.id
@@ -2610,8 +2863,9 @@ def render(menu):
         ].copy()
         total_invoice_amount = float(summary_invoices_df["total"].sum()) if not summary_invoices_df.empty else 0
         total_paid = float(summary_invoices_df["paid"].sum()) if not summary_invoices_df.empty else 0
+        total_credits = float(summary_invoices_df["credits"].sum()) if not summary_invoices_df.empty else 0
         total_outstanding = float(summary_invoices_df["outstanding"].sum()) if not summary_invoices_df.empty else 0
-        financial_col1, financial_col2, financial_col3 = st.columns(3)
+        financial_col1, financial_col2, financial_col3, financial_col4 = st.columns(4)
 
         with financial_col1:
             st.markdown(
@@ -2636,6 +2890,17 @@ def render(menu):
                 unsafe_allow_html=True
             )
         with financial_col3:
+            st.markdown(
+                f"""
+                <div class="dashboard-card">
+                    <div class="dashboard-card-label">Return Credits</div>
+                    <div class="dashboard-card-value">${total_credits:,.2f}</div>
+                    <div class="dashboard-card-note">Credits issued for customer returns</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with financial_col4:
             st.markdown(
                 f"""
                 <div class="dashboard-card">
@@ -3226,6 +3491,7 @@ def render(menu):
                 invoice_display_df["balance_status"] = invoice_display_df["status_label"]
                 invoice_display_df["total_display"] = invoice_display_df["total"].apply(format_currency)
                 invoice_display_df["paid_display"] = invoice_display_df["paid"].apply(format_currency)
+                invoice_display_df["credits_display"] = invoice_display_df["credits"].apply(format_currency)
                 invoice_display_df["outstanding_display"] = invoice_display_df["outstanding"].apply(format_currency)
                 invoice_display_df = invoice_display_df[
                     [
@@ -3235,6 +3501,7 @@ def render(menu):
                         "customer_name",
                         "total_display",
                         "paid_display",
+                        "credits_display",
                         "outstanding_display",
                         "balance_status",
                         "created_at",
@@ -3252,6 +3519,7 @@ def render(menu):
                     "customer_name": "Customer",
                     "total_display": "Total",
                     "paid_display": "Paid",
+                    "credits_display": "Return Credits",
                     "outstanding_display": "Outstanding",
                     "balance_status": "Is Paid",
                     "created_at": "Created",
@@ -3343,7 +3611,8 @@ def render(menu):
             SELECT r.id, r.invoice_id, inv.invoice_number, inv.created_by AS invoice_created_by,
                    r.location_id, l.name AS location,
                    r.item_code, i.item_name, r.quantity, r.reason,
-                   r.condition_status, r.recorded_by, r.status, r.created_at,
+                   r.condition_status, r.affected_owner_username,
+                   r.recorded_by, r.status, r.created_at,
                    r.quantity_before, r.quantity_after, r.inventory_action
             FROM returns r
             LEFT JOIN invoices inv ON inv.id = r.invoice_id
@@ -3463,11 +3732,11 @@ def render(menu):
                     eligible_items_df = pd.read_sql_query(
                         f'''SELECT inv.id AS invoice_id, inv.invoice_number, inv.customer_name,
                                   inv.created_by AS invoice_created_by,
-                                  ii.item_code, i.item_name, ii.quantity AS sold_quantity,
+                                  ii.item_code, i.item_name, SUM(ii.quantity) AS sold_quantity,
                                   COALESCE((SELECT SUM(r.quantity) FROM returns r
                                             WHERE r.invoice_id=inv.id
                                               AND LOWER(r.item_code)=LOWER(ii.item_code)
-                                              AND r.condition_status='customer_return'
+                                              AND r.condition_status IN ('customer_return','customer_return_damaged')
                                               AND r.status='completed'),0) AS returned_quantity
                            FROM invoices inv
                            JOIN invoice_items ii ON ii.invoice_id=inv.id
@@ -3475,6 +3744,7 @@ def render(menu):
                            WHERE inv.location_id=?
                              AND LOWER(COALESCE(inv.status,'')) NOT IN ('cancelled','canceled','void')
                              {creator_filter}
+                           GROUP BY inv.id, LOWER(ii.item_code)
                            ORDER BY inv.id DESC''',
                         invoice_conn,
                         params=tuple(invoice_params)
@@ -3556,6 +3826,9 @@ def render(menu):
                         & (return_stock_df["item_code"].str.lower() == str(item_code).lower())
                     ]
                     current_stock = int(stock_match["quantity"].iloc[0]) if not stock_match.empty else 0
+                    affected_owner_username = None
+                    selected_owner_available = 0
+                    unowned_here = current_stock
                     visible_current_stock = current_stock
                     if get_current_role() in {"admin", "sales"}:
                         visible_conn = get_connection()
@@ -3603,7 +3876,7 @@ def render(menu):
                         st.caption(
                             f"Assigned-user ownership here: {owned_here}; "
                             f"unowned company stock here: {unowned_here}. "
-                            "Damage uses unowned stock first, then assigned-user ownership FIFO."
+                            "Select an owner only when the damage must also reduce assigned stock."
                         )
                         if not ownership_df.empty:
                             st.dataframe(
@@ -3615,6 +3888,21 @@ def render(menu):
                                     "role": "Role",
                                     "owned_quantity": "Owned Quantity Here",
                                 }
+                            )
+                            damage_owner_options = {"Unowned company stock only": (None, 0)}
+                            damage_owner_options.update({
+                                f"{row['username']} ({str(row['role']).title()})": (
+                                    str(row["username"]), int(row["owned_quantity"])
+                                )
+                                for _, row in ownership_df.iterrows()
+                            })
+                            selected_damage_owner = st.selectbox(
+                                "Stock Owner Affected by Damage",
+                                list(damage_owner_options.keys()),
+                                key=f"damage_owner_{location_id}_{item_code}_{returns_form_reset_counter}"
+                            )
+                            affected_owner_username, selected_owner_available = (
+                                damage_owner_options[selected_damage_owner]
                             )
 
                     limit_conn = get_connection()
@@ -3632,7 +3920,8 @@ def render(menu):
                             limit_c.execute(
                                 '''SELECT COALESCE(SUM(quantity),0) FROM returns
                                    WHERE invoice_id=? AND location_id=? AND LOWER(item_code)=LOWER(?)
-                                     AND condition_status='customer_return' AND status='completed' ''',
+                                     AND condition_status IN ('customer_return','customer_return_damaged')
+                                     AND status='completed' ''',
                                 (selected_return_invoice_id, location_id, item_code)
                             )
                             maximum_allowed = max(
@@ -3650,8 +3939,17 @@ def render(menu):
                                        WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
                                     (st.session_state.username, item_code)
                                 )
-                                remaining_assignment_preview = max(
-                                    assigned_preview - int(limit_c.fetchone()[0] or 0), 0
+                                placed_preview = int(limit_c.fetchone()[0] or 0)
+                                limit_c.execute(
+                                    '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                       WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                         AND condition_status<>'customer_return'
+                                         AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))
+                                             =LOWER(?)''',
+                                    (item_code, st.session_state.username)
+                                )
+                                remaining_assignment_preview = calculate_remaining_assignment(
+                                    assigned_preview, placed_preview, int(limit_c.fetchone()[0] or 0)
                                 )
                                 maximum_allowed = min(maximum_allowed, remaining_assignment_preview)
                         else:
@@ -3665,6 +3963,11 @@ def render(menu):
                                 )
                                 maximum_allowed = min(
                                     current_stock, int(limit_c.fetchone()[0] or 0)
+                                )
+                            elif is_super_admin():
+                                maximum_allowed = min(
+                                    current_stock,
+                                    unowned_here + selected_owner_available
                                 )
                     finally:
                         limit_conn.close()
@@ -3682,10 +3985,20 @@ def render(menu):
                             + f"_{returns_form_reset_counter}"
                         )
                         if is_customer_return:
-                            condition_status = "customer_return"
+                            return_disposition = st.selectbox(
+                                "Returned Item Condition",
+                                ["Sellable — return to stock", "Damaged / defective — write off"],
+                                key=f"return_disposition_{returns_form_reset_counter}"
+                            )
+                            condition_status = (
+                                "customer_return"
+                                if return_disposition.startswith("Sellable")
+                                else "customer_return_damaged"
+                            )
                             st.info(
-                                "A sellable customer return adds stock back to this location. "
-                                "The quantity cannot exceed sold quantity minus earlier returns."
+                                "Sellable returns add stock back. Damaged/defective returns create a permanent "
+                                "write-off without increasing stock. Both create an invoice credit and cannot "
+                                "exceed sold quantity minus earlier returns."
                             )
                         else:
                             condition_status = st.selectbox(
@@ -3703,6 +4016,8 @@ def render(menu):
                         return_quantity_preview = int(return_quantity or 0)
                         quantity_after_preview = (
                             visible_current_stock + return_quantity_preview
+                            if is_customer_return and condition_status == "customer_return"
+                            else visible_current_stock
                             if is_customer_return
                             else max(visible_current_stock - return_quantity_preview, 0)
                         )
@@ -3745,7 +4060,7 @@ def render(menu):
                                 result = record_return_stock(
                                     conn, st.session_state.username, get_current_role(), location_id,
                                     item_code, return_quantity, return_reason, condition_status,
-                                    selected_return_invoice_id
+                                    selected_return_invoice_id, affected_owner_username
                                 )
                                 st.session_state.returns_saved_message = (
                                     f"{'Return' if is_customer_return else 'Damage / bad item'} saved. "
@@ -3763,6 +4078,9 @@ def render(menu):
     if menu == "Transfers" and has_admin_access():
         if "transfer_message" in st.session_state:
             st.success(st.session_state.pop("transfer_message"))
+        if "transfer_form_reset_counter" not in st.session_state:
+            st.session_state.transfer_form_reset_counter = 0
+        transfer_form_reset_counter = st.session_state.transfer_form_reset_counter
         conn = get_connection()
         locations_df = pd.read_sql_query("SELECT id, name FROM locations WHERE active=1 ORDER BY name", conn)
         inventory_df = pd.read_sql_query("SELECT item_code, item_name FROM inventory ORDER BY item_name", conn)
@@ -3883,7 +4201,7 @@ def render(menu):
                 source_location = st.selectbox(
                     "From Location",
                     list(location_options.keys()),
-                    key="transfer_source_location"
+                    key=f"transfer_source_location_{transfer_form_reset_counter}"
                 )
                 source_location_id_preview = location_options[source_location]
                 source_items_df = transfer_stock_df[
@@ -3926,7 +4244,10 @@ def render(menu):
                 if not item_options:
                     st.info("The selected source has no transferable scoped stock after pending reservations.")
                 else:
-                    transfer_item = st.selectbox("Item", list(item_options.keys()), key="transfer_item")
+                    transfer_item = st.selectbox(
+                        "Item", list(item_options.keys()),
+                        key=f"transfer_item_{transfer_form_reset_counter}"
+                    )
                     item_code_preview = item_options[transfer_item]
                     preview_row = source_items_df[source_items_df["item_code"] == item_code_preview].iloc[0]
                     destination_options = {
@@ -3937,7 +4258,8 @@ def render(menu):
                     # preview updates immediately on every change.
                     with st.container(border=True):
                         destination_location = st.selectbox(
-                            "To Location", list(destination_options.keys()), key="transfer_destination_location"
+                            "To Location", list(destination_options.keys()),
+                            key=f"transfer_destination_location_{transfer_form_reset_counter}"
                         )
                         transfer_quantity = st.number_input(
                             "Quantity",
@@ -3945,7 +4267,7 @@ def render(menu):
                             value=None,
                             step=1,
                             placeholder="Enter quantity to transfer",
-                            key="transfer_quantity"
+                            key=f"transfer_quantity_{transfer_form_reset_counter}"
                         )
                         transfer_status = st.selectbox(
                             "Status",
@@ -3954,7 +4276,8 @@ def render(menu):
                                 "Completed — move stock now"
                                 if status == "completed"
                                 else "Pending — reserve only"
-                            )
+                            ),
+                            key=f"transfer_status_{transfer_form_reset_counter}"
                         )
                         destination_location_id_preview = destination_options[destination_location]
                         destination_preview_rows = transfer_stock_df[
@@ -4045,7 +4368,7 @@ def render(menu):
                             type="primary",
                             width="stretch",
                             disabled=not transfer_quantity_is_valid,
-                            key="save_inventory_transfer"
+                            key=f"save_inventory_transfer_{transfer_form_reset_counter}"
                         )
 
                 if save_transfer:
@@ -4286,6 +4609,7 @@ def render(menu):
                                     f"Pending transfer saved. {transfer_quantity_int} unit(s) are reserved; "
                                     "location quantities have not changed."
                                 )
+                            st.session_state.transfer_form_reset_counter += 1
                             st.rerun()
                         finally:
                             conn.close()
