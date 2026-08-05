@@ -1,7 +1,10 @@
 
-streamlit
-pandas
-qrcode
-pillow
-opencv-python
-numpy
+streamlit==1.57.0
+# Streamlit 1.57's ASGI integration is not compatible with Starlette 1.0's
+# changed GZipResponder constructor. Keep the latest patched 0.x release.
+starlette>=0.47.2,<1.0
+pandas>=2.2,<3.0
+qrcode>=7.4,<9.0
+pillow>=10.4,<13.0
+opencv-python-headless>=4.10,<5.0
+numpy>=2.0,<3.0
