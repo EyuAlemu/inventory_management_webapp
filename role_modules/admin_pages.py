@@ -72,6 +72,25 @@ def calculate_company_physical_quantity(location_quantity, user_quantity):
     return max(int(location_quantity or 0), 0) + max(int(user_quantity or 0), 0)
 
 
+def get_location_physical_stock_metrics(cursor, item_code, selected_location_id):
+    """Return authoritative physical stock totals for an item and one location."""
+    cursor.execute(
+        '''SELECT COALESCE(SUM(quantity),0) AS all_locations_quantity,
+                  COALESCE(SUM(CASE WHEN location_id=? THEN quantity ELSE 0 END),0)
+                      AS selected_location_quantity
+           FROM location_inventory
+           WHERE LOWER(item_code)=LOWER(?)''',
+        (selected_location_id, item_code),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {"all_locations": 0, "selected_location": 0}
+    return {
+        "all_locations": max(int(row[0] or 0), 0),
+        "selected_location": max(int(row[1] or 0), 0),
+    }
+
+
 def is_dashboard_usage_transaction(transaction_type):
     """Dashboard usage analytics represent completed sales, not every stock movement."""
     return str(transaction_type or "").strip().lower() == "sale"
@@ -1894,15 +1913,11 @@ def render(menu):
                 )
                 conn = get_connection()
                 c = conn.cursor()
-                c.execute(
-                    '''
-                    SELECT COALESCE(SUM(quantity), 0)
-                    FROM location_inventory
-                    WHERE location_id=? AND LOWER(item_code)=LOWER(?)
-                    ''',
-                    (location_id, item_code)
+                physical_stock_metrics = get_location_physical_stock_metrics(
+                    c, item_code, location_id
                 )
-                current_location_quantity = int(c.fetchone()[0] or 0)
+                all_assigned_quantity = physical_stock_metrics["all_locations"]
+                current_location_quantity = physical_stock_metrics["selected_location"]
                 c.execute(
                     '''SELECT COALESCE(SUM(quantity),0) FROM admin_product_allocations
                        WHERE LOWER(item_code)=LOWER(?)''',
@@ -1975,7 +1990,6 @@ def render(menu):
                     if not current_stock_rows.empty and pd.notna(current_stock_rows.iloc[0]["price"])
                     else 0.0
                 )
-                all_assigned_quantity = int(all_item_stock_rows["quantity"].sum())
                 admin_reserved_remaining = calculate_remaining_assignment(
                     total_admin_assigned_quantity,
                     total_admin_placed_quantity,
