@@ -217,6 +217,10 @@ def init_db():
     invoice_item_columns = {column[1] for column in c.fetchall()}
     if "owner_username" not in invoice_item_columns:
         c.execute("ALTER TABLE invoice_items ADD COLUMN owner_username TEXT")
+    if "generic_quantity" not in invoice_item_columns:
+        c.execute("ALTER TABLE invoice_items ADD COLUMN generic_quantity INTEGER DEFAULT 0")
+    if "owner_quantity" not in invoice_item_columns:
+        c.execute("ALTER TABLE invoice_items ADD COLUMN owner_quantity INTEGER DEFAULT 0")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS payments (
@@ -282,6 +286,8 @@ def init_db():
         c.execute("ALTER TABLE returns ADD COLUMN invoice_id INTEGER")
     if "affected_owner_username" not in return_columns:
         c.execute("ALTER TABLE returns ADD COLUMN affected_owner_username TEXT")
+    if "owner_quantity" not in return_columns:
+        c.execute("ALTER TABLE returns ADD COLUMN owner_quantity INTEGER DEFAULT 0")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS inventory_transfers (
@@ -297,6 +303,10 @@ def init_db():
         completed_at TEXT
     )
     ''')
+    c.execute("PRAGMA table_info(inventory_transfers)")
+    transfer_columns = {column[1] for column in c.fetchall()}
+    if "affected_owner_username" not in transfer_columns:
+        c.execute("ALTER TABLE inventory_transfers ADD COLUMN affected_owner_username TEXT")
 
     c.execute('''
     CREATE TABLE IF NOT EXISTS product_suppliers (

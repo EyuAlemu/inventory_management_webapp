@@ -810,10 +810,15 @@ def render(menu):
                             c.execute(
                                 '''
                                 INSERT INTO invoice_items
-                                (invoice_id,item_code,quantity,unit_price,line_total)
-                                VALUES (?,?,?,?,?)
+                                (invoice_id,item_code,quantity,unit_price,line_total,owner_username,
+                                 generic_quantity,owner_quantity)
+                                VALUES (?,?,?,?,?,?,?,?)
                                 ''',
-                                (invoice_id, selected_item_code, quantity_int, float(unit_price), line_total)
+                                (
+                                    invoice_id, selected_item_code, quantity_int,
+                                    float(unit_price), line_total, st.session_state.username,
+                                    0, quantity_int,
+                                )
                             )
                             if payment_amount_rounded > 0:
                                 c.execute(
@@ -837,8 +842,10 @@ def render(menu):
                             c.execute(
                                 '''
                                     INSERT INTO transactions
-                                    (username,item_code,quantity_used,quantity_before,quantity_after,transaction_type,source_type,location_id,transaction_time)
-                                    VALUES (?,?,?,?,?,?,?,?,?)
+                                    (username,item_code,quantity_used,quantity_before,quantity_after,
+                                     transaction_type,source_type,location_id,transaction_time,
+                                     affected_owner_username)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?)
                                     ''',
                                     (
                                         st.session_state.username,
@@ -849,7 +856,8 @@ def render(menu):
                                         "sale",
                                         "location_stock",
                                         selected_location_id,
-                                        now
+                                        now,
+                                        st.session_state.username,
                                     )
                                 )
                             conn.commit()

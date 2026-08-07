@@ -24,6 +24,51 @@ def calculate_available_product_assignment(
     )
 
 
+def calculate_location_edit_capacity(
+    base_quantity, stock_elsewhere=0, user_stock=0, written_off=0, net_sold=0
+):
+    """Maximum physical stock allowed at one location without recreating consumed units."""
+    return max(
+        int(base_quantity or 0)
+        - int(stock_elsewhere or 0)
+        - int(user_stock or 0)
+        - int(written_off or 0)
+        - int(net_sold or 0),
+        0,
+    )
+
+
+def validate_location_reduction(current_quantity, requested_quantity, owned_quantity):
+    """Reject direct edits that would silently destroy Admin/Sales-owned stock."""
+    reduction = max(int(current_quantity or 0) - int(requested_quantity or 0), 0)
+    unowned_quantity = max(int(current_quantity or 0) - int(owned_quantity or 0), 0)
+    if reduction > unowned_quantity:
+        raise ValueError(
+            f"Only {unowned_quantity} unowned unit(s) can be removed here. "
+            "Transfer owned stock or record its damage/return against the affected owner first."
+        )
+    return reduction
+
+
+def validate_main_item_cost(cursor, item_code, new_cost):
+    """Require a positive purchase cost below every configured selling price."""
+    new_cost = float(new_cost)
+    if not math.isfinite(new_cost) or new_cost <= 0:
+        raise ValueError("Single Cost / Purchase Cost must be greater than zero.")
+    cursor.execute(
+        '''SELECT COALESCE(MIN(price),0) FROM location_prices
+           WHERE LOWER(item_code)=LOWER(?) AND price>0''',
+        (item_code,),
+    )
+    minimum_price = float(cursor.fetchone()[0] or 0)
+    if minimum_price > 0 and new_cost >= minimum_price:
+        raise ValueError(
+            f"Purchase cost must remain below every location selling price. "
+            f"The lowest current selling price is ${minimum_price:,.2f}."
+        )
+    return round(new_cost, 2)
+
+
 def get_generic_written_off_quantity(cursor, item_code):
     """Return completed write-offs not charged to an Admin or Sales assignment."""
     cursor.execute(
@@ -57,6 +102,12 @@ def get_net_sold_quantity(cursor, item_code, owner_username=None):
         owner_return_filter = " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)"
         sale_params.append(owner_username)
         return_params.append(owner_username)
+    return_quantity_expression = (
+        "quantity"
+        if owner_username is None
+        else "CASE WHEN COALESCE(owner_quantity,0)>0 THEN owner_quantity "
+             "WHEN COALESCE(NULLIF(affected_owner_username,''),'')<>'' THEN quantity ELSE 0 END"
+    )
     cursor.execute(
         f'''SELECT COALESCE(SUM(quantity_used),0) FROM transactions
             WHERE LOWER(item_code)=LOWER(?) AND transaction_type='sale'{owner_sale_filter}''',
@@ -64,13 +115,19 @@ def get_net_sold_quantity(cursor, item_code, owner_username=None):
     )
     sold = int(cursor.fetchone()[0] or 0)
     cursor.execute(
-        f'''SELECT COALESCE(SUM(quantity),0) FROM returns
+        f'''SELECT COALESCE(SUM(quantity_used),0) FROM transactions
+            WHERE LOWER(item_code)=LOWER(?) AND transaction_type='invoice_void'{owner_sale_filter}''',
+        tuple(sale_params)
+    )
+    voided = int(cursor.fetchone()[0] or 0)
+    cursor.execute(
+        f'''SELECT COALESCE(SUM({return_quantity_expression}),0) FROM returns
             WHERE LOWER(item_code)=LOWER(?) AND status='completed'
               AND condition_status IN ('customer_return','customer_return_damaged')
               {owner_return_filter}''',
         tuple(return_params)
     )
-    return max(sold - int(cursor.fetchone()[0] or 0), 0)
+    return max(sold - voided - int(cursor.fetchone()[0] or 0), 0)
 
 
 def get_generic_net_sold_quantity(cursor, item_code):
@@ -83,15 +140,54 @@ def get_generic_net_sold_quantity(cursor, item_code):
     return max(total - sum(get_net_sold_quantity(cursor, item_code, owner) for owner in owners), 0)
 
 
+def get_total_assignment_remaining(cursor, item_code):
+    """Return usable reservation remaining across every Admin/Sales owner for an item."""
+    cursor.execute(
+        '''SELECT username,COALESCE(quantity,0) FROM admin_product_allocations
+           WHERE LOWER(item_code)=LOWER(?)''',
+        (item_code,),
+    )
+    total_remaining = 0
+    for username, assigned_quantity in cursor.fetchall():
+        cursor.execute(
+            '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+               WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
+            (username, item_code),
+        )
+        placed_quantity = int(cursor.fetchone()[0] or 0)
+        cursor.execute(
+            '''SELECT COALESCE(SUM(quantity),0) FROM returns
+               WHERE status='completed' AND condition_status<>'customer_return'
+                 AND LOWER(item_code)=LOWER(?)
+                 AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)''',
+            (item_code, username),
+        )
+        written_off = int(cursor.fetchone()[0] or 0)
+        total_remaining += max(
+            int(assigned_quantity or 0) - placed_quantity - written_off
+            - get_net_sold_quantity(cursor, item_code, username),
+            0,
+        )
+    return total_remaining
+
+
 def create_inventory_entry(
     conn, item_code, item_name, description, quantity, cost, location_id, created_by, selling_price=0
 ):
     """Create a master item and place its full starting quantity in the selected active location."""
     item_code = str(item_code or "").strip()
     item_name = str(item_name or "").strip()
-    quantity = int(quantity)
     if not item_code or not item_name:
         raise ValueError("Item code and item name are required.")
+    if isinstance(quantity, bool):
+        raise ValueError("Quantity must be a positive whole number.")
+    try:
+        numeric_quantity = float(quantity)
+    except (TypeError, ValueError):
+        raise ValueError("Quantity must be a positive whole number.")
+    if not math.isfinite(numeric_quantity) or not numeric_quantity.is_integer():
+        raise ValueError("Quantity must be a positive whole number.")
+    quantity = int(numeric_quantity)
     if quantity <= 0:
         raise ValueError("Quantity must be greater than zero.")
     cost = float(cost)
@@ -102,8 +198,8 @@ def create_inventory_entry(
         raise ValueError("Location Selling Price must be a valid number.")
     if selling_price < 0:
         raise ValueError("Selling Price cannot be negative.")
-    if selling_price > 0 and selling_price < cost:
-        raise ValueError("Location Selling Price cannot be lower than Unit Purchase Cost.")
+    if selling_price > 0 and selling_price <= cost:
+        raise ValueError("Location Selling Price must be greater than Unit Purchase Cost.")
     cost = round(cost, 2)
     selling_price = round(selling_price, 2)
 
@@ -143,6 +239,17 @@ def create_inventory_entry(
                 location_id, item_code, 0, quantity, quantity, "Inventory Entry",
                 created_by, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             )
+        )
+        cursor.execute(
+            '''INSERT INTO transactions
+               (username,item_code,quantity_used,quantity_before,quantity_after,
+                transaction_type,source_type,location_id,transaction_time)
+               VALUES (?,?,?,?,?,?,?,?,?)''',
+            (
+                created_by, item_code, quantity, 0, quantity,
+                "inventory_entry", "location_stock", location_id,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
         )
         conn.commit()
         return {"item_code": item_code, "location_id": int(location_id), "quantity": quantity}
@@ -247,6 +354,7 @@ def get_user_deletion_blockers(cursor, username):
     cursor.execute(
         '''SELECT COUNT(*) FROM invoices inv
            WHERE LOWER(COALESCE(inv.created_by,''))=LOWER(?)
+             AND LOWER(COALESCE(inv.status,'')) NOT IN ('void','cancelled','canceled')
              AND inv.total
                  - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=inv.id),0)
                  - COALESCE((SELECT SUM(ic.amount) FROM invoice_credits ic WHERE ic.invoice_id=inv.id),0)>0''',
@@ -298,6 +406,8 @@ def render(menu):
             inventory_entry_key = st.session_state.inventory_entry_reset_counter
             if "inventory_entry_message" in st.session_state:
                 st.success(st.session_state.pop("inventory_entry_message"))
+            if "inventory_entry_qr_error" in st.session_state:
+                st.warning(st.session_state.pop("inventory_entry_qr_error"))
             if "inventory_entry_qr_path" in st.session_state:
                 saved_qr_path, saved_qr_code = st.session_state.pop("inventory_entry_qr_path")
                 st.image(saved_qr_path, caption=f"QR Code: {saved_qr_code}", width=180)
@@ -397,13 +507,13 @@ def render(menu):
                         or (
                             float(selling_price) > 0
                             and purchase_cost_valid
-                            and float(selling_price) >= float(inventory_cost)
+                            and float(selling_price) > float(inventory_cost)
                         )
                     )
                     if inventory_cost is None:
                         st.caption("Unit Purchase Cost is required.")
-                    if selling_price is not None and purchase_cost_valid and float(selling_price) < float(inventory_cost):
-                        st.error("Location Selling Price cannot be lower than Unit Purchase Cost.")
+                    if selling_price is not None and purchase_cost_valid and float(selling_price) <= float(inventory_cost):
+                        st.error("Location Selling Price must be greater than Unit Purchase Cost.")
 
                     save_inventory = st.button(
                         "Save Inventory Entry",
@@ -510,7 +620,7 @@ def render(menu):
                                 item_code.strip(),
                             )
                         except Exception as qr_error:
-                            st.warning(
+                            st.session_state.inventory_entry_qr_error = (
                                 f"Inventory was saved, but its QR code could not be generated: {qr_error}"
                             )
                         st.session_state.inventory_entry_message = inventory_saved_message
@@ -547,6 +657,16 @@ def render(menu):
                            FROM admin_location_stock als
                            WHERE LOWER(als.item_code)=LOWER(i.item_code)
                        ), 0) AS admin_added_quantity,
+                       COALESCE((
+                           SELECT SUM(ui.quantity) FROM user_inventory ui
+                           WHERE LOWER(ui.item_code)=LOWER(i.item_code)
+                       ),0) AS user_stock_quantity,
+                       COALESCE((
+                           SELECT SUM(r.quantity) FROM returns r
+                           WHERE LOWER(r.item_code)=LOWER(i.item_code)
+                             AND r.status='completed'
+                             AND r.condition_status<>'customer_return'
+                       ),0) AS written_off_quantity,
                        i.cost,
                        li.location_id,
                        COALESCE(l.name, '') AS location_name,
@@ -565,6 +685,14 @@ def render(menu):
                 conn
             )
 
+            net_sold_by_item = {
+                item_code: get_net_sold_quantity(conn.cursor(), item_code)
+                for item_code in df["item_code"].dropna().astype(str).unique()
+            } if not df.empty else {}
+            assignment_remaining_by_item = {
+                item_code: get_total_assignment_remaining(conn.cursor(), item_code)
+                for item_code in df["item_code"].dropna().astype(str).unique()
+            } if not df.empty else {}
             conn.close()
 
             st.markdown(
@@ -583,7 +711,28 @@ def render(menu):
                 df["inventory_quantity"] = pd.to_numeric(df["inventory_quantity"], errors="coerce").fillna(0).astype(int)
                 df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(0.0)
                 df["assigned_quantity"] = df.groupby("item_code")["quantity"].transform("sum").astype(int)
-                df["available_quantity"] = (df["inventory_quantity"] - df["assigned_quantity"]).astype(int)
+                df["user_stock_quantity"] = pd.to_numeric(
+                    df["user_stock_quantity"], errors="coerce"
+                ).fillna(0).astype(int)
+                df["written_off_quantity"] = pd.to_numeric(
+                    df["written_off_quantity"], errors="coerce"
+                ).fillna(0).astype(int)
+                df["net_sold_quantity"] = (
+                    df["item_code"].map(net_sold_by_item).fillna(0).astype(int)
+                )
+                df["raw_available_quantity"] = (
+                    df["inventory_quantity"] - df["assigned_quantity"]
+                    - df["user_stock_quantity"] - df["written_off_quantity"]
+                    - df["net_sold_quantity"]
+                ).astype(int)
+                df["available_quantity"] = df.apply(
+                    lambda row: calculate_location_edit_capacity(
+                        row["inventory_quantity"], row["assigned_quantity"],
+                        row["user_stock_quantity"], row["written_off_quantity"],
+                        row["net_sold_quantity"],
+                    ),
+                    axis=1,
+                ).astype(int)
                 df["admin_assigned_quantity"] = pd.to_numeric(
                     df["admin_assigned_quantity"], errors="coerce"
                 ).fillna(0).astype(int)
@@ -591,9 +740,9 @@ def render(menu):
                     df["admin_added_quantity"], errors="coerce"
                 ).fillna(0).clip(lower=0).astype(int)
                 df["admin_remaining_quantity"] = (
-                    df["admin_assigned_quantity"] - df["admin_added_quantity"]
-                ).clip(lower=0).astype(int)
-                df["quantity_integrity"] = df["available_quantity"].apply(
+                    df["item_code"].map(assignment_remaining_by_item).fillna(0).astype(int)
+                )
+                df["quantity_integrity"] = df["raw_available_quantity"].apply(
                     lambda available: "Over-allocated" if int(available) < 0 else "Valid"
                 )
                 df["total_cost"] = df["quantity"] * df["cost"]
@@ -696,6 +845,9 @@ def render(menu):
                     table_df["Assigned To Admins"] = table_df["admin_assigned_quantity"]
                     table_df["Added By Admins"] = table_df["admin_added_quantity"]
                     table_df["Admin Assignment Remaining"] = table_df["admin_remaining_quantity"]
+                    table_df["Standard User Stock"] = table_df["user_stock_quantity"]
+                    table_df["Written Off"] = table_df["written_off_quantity"]
+                    table_df["Net Sold"] = table_df["net_sold_quantity"]
                     table_df["Available Quantity"] = table_df["available_quantity"]
                     table_df["Quantity Integrity"] = table_df["quantity_integrity"]
                     table_df["Single Cost"] = table_df["cost"]
@@ -731,6 +883,9 @@ def render(menu):
                         "Assigned To Admins",
                         "Added By Admins",
                         "Admin Assignment Remaining",
+                        "Standard User Stock",
+                        "Written Off",
+                        "Net Sold",
                         "Available Quantity",
                         "Quantity Integrity",
                         "Single Cost",
@@ -747,6 +902,9 @@ def render(menu):
                         "Assigned To Admins",
                         "Added By Admins",
                         "Admin Assignment Remaining",
+                        "Standard User Stock",
+                        "Written Off",
+                        "Net Sold",
                         "Available Quantity",
                         "Quantity Integrity",
                         "Single Cost",
@@ -1099,7 +1257,7 @@ def render(menu):
                         )
                         edit_main_cost = st.number_input(
                             "Single Cost / Purchase Cost",
-                            min_value=0.0,
+                            min_value=0.01,
                             step=0.01,
                             value=current_main_cost,
                             format="%.2f",
@@ -1143,6 +1301,9 @@ def render(menu):
                                 updated_main_base_quantity = calculate_new_base_quantity(
                                     locked_base_quantity, edit_main_quantity_to_add
                                 )
+                                validated_main_cost = validate_main_item_cost(
+                                    c, old_main_item_code, edit_main_cost
+                                )
                                 c.execute(
                                     '''SELECT COUNT(*) FROM inventory
                                        WHERE id<>? AND LOWER(item_code)=LOWER(?)''',
@@ -1164,7 +1325,7 @@ def render(menu):
                                         edit_main_item_name.strip(),
                                         edit_main_description.strip(),
                                         updated_main_base_quantity,
-                                        float(edit_main_cost),
+                                        validated_main_cost,
                                         main_item_id
                                     )
                                 )
@@ -1297,8 +1458,14 @@ def render(menu):
                             0
                         )
                         max_location_quantity_for_edit = max(
-                            current_base_quantity - assigned_elsewhere_for_edit,
-                            0
+                            calculate_location_edit_capacity(
+                                current_base_quantity,
+                                assigned_elsewhere_for_edit,
+                                selected_item.get("user_stock_quantity", 0),
+                                selected_item.get("written_off_quantity", 0),
+                                selected_item.get("net_sold_quantity", 0),
+                            ),
+                            current_location_quantity,
                         )
 
                         with st.form(f"edit_inventory_form_{selected_item_id}_{selected_location_id or 'unassigned'}"):
@@ -1515,13 +1682,50 @@ def render(menu):
                                                 (owner_username, selected_update_location_id, current_item_code, ownership_moved)
                                             )
                                             remaining_ownership_to_move -= ownership_moved
+                                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        c.execute(
+                                            '''INSERT INTO transactions
+                                               (username,item_code,quantity_used,quantity_before,quantity_after,
+                                                transaction_type,source_type,location_id,transaction_time)
+                                               VALUES (?,?,?,?,?,?,?,?,?)''',
+                                            (st.session_state.username, current_item_code, requested_quantity,
+                                             locked_source_quantity, source_quantity_after,
+                                             "inventory_move_out", "location_stock",
+                                             selected_location_id, now),
+                                        )
+                                        c.execute(
+                                            '''INSERT INTO transactions
+                                               (username,item_code,quantity_used,quantity_before,quantity_after,
+                                                transaction_type,source_type,location_id,transaction_time)
+                                               VALUES (?,?,?,?,?,?,?,?,?)''',
+                                            (st.session_state.username, current_item_code, requested_quantity,
+                                             destination_quantity_before, destination_quantity_after,
+                                             "inventory_move_in", "location_stock",
+                                             selected_update_location_id, now),
+                                        )
                                     else:
                                         c.execute(
                                             "SELECT COALESCE(SUM(quantity),0) FROM location_inventory WHERE LOWER(item_code)=LOWER(?) AND location_id<>?",
                                             (current_item_code, selected_location_id)
                                         )
                                         locked_elsewhere_quantity = int(c.fetchone()[0] or 0)
-                                        locked_max_quantity = max(current_base_quantity - locked_elsewhere_quantity, 0)
+                                        c.execute(
+                                            "SELECT COALESCE(SUM(quantity),0) FROM user_inventory WHERE LOWER(item_code)=LOWER(?)",
+                                            (current_item_code,),
+                                        )
+                                        locked_user_quantity = int(c.fetchone()[0] or 0)
+                                        c.execute(
+                                            '''SELECT COALESCE(SUM(quantity),0) FROM returns
+                                               WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+                                                 AND condition_status<>'customer_return' ''',
+                                            (current_item_code,),
+                                        )
+                                        locked_written_off = int(c.fetchone()[0] or 0)
+                                        locked_net_sold = get_net_sold_quantity(c, current_item_code)
+                                        locked_max_quantity = calculate_location_edit_capacity(
+                                            current_base_quantity, locked_elsewhere_quantity,
+                                            locked_user_quantity, locked_written_off, locked_net_sold,
+                                        )
                                         if (
                                             requested_quantity > locked_source_quantity
                                             and requested_quantity > locked_max_quantity
@@ -1533,6 +1737,15 @@ def render(menu):
                                             )
                                             st.stop()
                                         quantity_change = requested_quantity - locked_source_quantity
+                                        c.execute(
+                                            '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                                               WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                                            (selected_location_id, current_item_code),
+                                        )
+                                        locked_owned_quantity = int(c.fetchone()[0] or 0)
+                                        validate_location_reduction(
+                                            locked_source_quantity, requested_quantity, locked_owned_quantity
+                                        )
                                         if requested_quantity == 0:
                                             c.execute(
                                                 "DELETE FROM location_inventory WHERE location_id=? AND LOWER(item_code)=LOWER(?)",
@@ -1547,22 +1760,6 @@ def render(menu):
                                                 "UPDATE location_inventory SET quantity=? WHERE location_id=? AND LOWER(item_code)=LOWER(?)",
                                                 (requested_quantity, selected_location_id, current_item_code)
                                             )
-                                        if quantity_change < 0:
-                                            remaining_reduction = -quantity_change
-                                            c.execute(
-                                                '''SELECT id,quantity FROM admin_location_stock
-                                                   WHERE location_id=? AND LOWER(item_code)=LOWER(?) AND quantity>0 ORDER BY id''',
-                                                (selected_location_id, current_item_code)
-                                            )
-                                            for owner_id, owner_quantity in c.fetchall():
-                                                reduction = min(int(owner_quantity), remaining_reduction)
-                                                c.execute(
-                                                    "UPDATE admin_location_stock SET quantity=quantity-? WHERE id=?",
-                                                    (reduction, owner_id)
-                                                )
-                                                remaining_reduction -= reduction
-                                                if remaining_reduction <= 0:
-                                                    break
                                         c.execute(
                                             '''INSERT INTO location_stock_history
                                                (location_id,item_code,quantity_before,quantity_set,quantity_after,action_type,updated_by,updated_at)
@@ -1575,6 +1772,19 @@ def render(menu):
                                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                             )
                                         )
+                                        if quantity_change != 0:
+                                            c.execute(
+                                                '''INSERT INTO transactions
+                                                   (username,item_code,quantity_used,quantity_before,quantity_after,
+                                                    transaction_type,source_type,location_id,transaction_time)
+                                                   VALUES (?,?,?,?,?,?,?,?,?)''',
+                                                (st.session_state.username, current_item_code, abs(quantity_change),
+                                                 locked_source_quantity, requested_quantity,
+                                                 "inventory_adjustment_add" if quantity_change > 0
+                                                 else "inventory_adjustment_remove",
+                                                 "location_stock", selected_location_id,
+                                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                                            )
 
                                     conn.commit()
                                     st.session_state.inventory_message = (
@@ -1677,6 +1887,15 @@ def render(menu):
                                     delete_quantity_row = c.fetchone()
                                     delete_quantity = int(delete_quantity_row[0] or 0) if delete_quantity_row else 0
                                     c.execute(
+                                        '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
+                                           WHERE location_id=? AND LOWER(item_code)=LOWER(?)''',
+                                        (selected_location_id, item_code_to_delete),
+                                    )
+                                    owned_delete_quantity = int(c.fetchone()[0] or 0)
+                                    validate_location_reduction(
+                                        delete_quantity, 0, owned_delete_quantity
+                                    )
+                                    c.execute(
                                         '''INSERT INTO location_stock_history
                                            (location_id,item_code,quantity_before,quantity_set,quantity_after,action_type,updated_by,updated_at)
                                            VALUES (?,?,?,?,?,?,?,?)''',
@@ -1687,10 +1906,17 @@ def render(menu):
                                             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         )
                                     )
-                                    c.execute(
-                                        "DELETE FROM admin_location_stock WHERE location_id=? AND LOWER(item_code)=LOWER(?)",
-                                        (selected_location_id, item_code_to_delete)
-                                    )
+                                    if delete_quantity > 0:
+                                        c.execute(
+                                            '''INSERT INTO transactions
+                                               (username,item_code,quantity_used,quantity_before,quantity_after,
+                                                transaction_type,source_type,location_id,transaction_time)
+                                               VALUES (?,?,?,?,?,?,?,?,?)''',
+                                            (st.session_state.username, item_code_to_delete, delete_quantity,
+                                             delete_quantity, 0, "inventory_location_remove",
+                                             "location_stock", selected_location_id,
+                                             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                                        )
                                 except sqlite3.Error as exc:
                                     conn.rollback()
                                     conn.close()
@@ -2960,7 +3186,15 @@ def render(menu):
         )
 
         if not sales_df.empty:
-            sales_df = sales_df[sales_df["transaction_type"] == "sale"].copy()
+            sales_df = sales_df[
+                sales_df["transaction_type"].isin(["sale", "invoice_void"])
+            ].copy()
+            sales_df["quantity_used"] = sales_df.apply(
+                lambda row: -int(row["quantity_used"] or 0)
+                if row["transaction_type"] == "invoice_void"
+                else int(row["quantity_used"] or 0),
+                axis=1,
+            )
 
         if sales_df.empty:
             st.info("No sales records are available yet. Sales will appear here after users or sales staff complete sale transactions.")
@@ -2972,12 +3206,14 @@ def render(menu):
                 errors="coerce"
             )
 
-            total_sales_records = len(sales_df)
-            total_quantity_sold = int(sales_df["quantity_used"].sum())
-            active_sales_users = sales_df["username"].nunique()
+            original_sales_df = sales_df[sales_df["transaction_type"] == "sale"]
+            net_sales_by_item = sales_df.groupby("item_code")["quantity_used"].sum().clip(lower=0)
+            positive_net_sales = net_sales_by_item[net_sales_by_item > 0]
+            total_sales_records = len(original_sales_df)
+            total_quantity_sold = max(int(sales_df["quantity_used"].sum()), 0)
+            active_sales_users = original_sales_df["username"].nunique()
             top_sold_item = (
-                sales_df.groupby("item_code")["quantity_used"].sum().idxmax()
-                if not sales_df.empty else "No sales yet"
+                positive_net_sales.idxmax() if not positive_net_sales.empty else "No net sales"
             )
 
             sales_col1, sales_col2, sales_col3, sales_col4 = st.columns(4)

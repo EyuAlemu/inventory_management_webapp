@@ -165,7 +165,7 @@ LIVE_ITEM_CODE_REFERENCE_TABLES = [
 def update_item_code_references(cursor, old_item_code, new_item_code):
     for table_name, column_name in ITEM_CODE_REFERENCE_TABLES:
         cursor.execute(
-            f"UPDATE {table_name} SET {column_name}=? WHERE {column_name}=?",
+            f"UPDATE {table_name} SET {column_name}=? WHERE LOWER({column_name})=LOWER(?)",
             (new_item_code, old_item_code)
         )
 
@@ -225,10 +225,26 @@ def transaction_verification_status(row):
     quantity_used = int(row.get("quantity_used") or 0)
     quantity_after = int(row.get("quantity_after") or 0)
 
-    if transaction_type in {"sale", "return", "take_out"}:
+    transaction_type = str(transaction_type or "legacy").strip().lower()
+    decrease_types = {
+        "sale", "return", "take_out", "damage", "transfer_out",
+        "stock_relocation_out", "inventory_move_out", "inventory_adjustment_remove",
+        "inventory_location_remove",
+    }
+    increase_types = {
+        "allocation", "customer_return", "invoice_void", "inventory_entry",
+        "transfer_in", "stock_relocation_in", "inventory_move_in",
+        "inventory_adjustment_add", "location_stock_add",
+    }
+    unchanged_types = {"customer_return_damaged"}
+    if transaction_type in decrease_types:
         expected_after = quantity_before - quantity_used
-    elif transaction_type == "allocation":
+    elif transaction_type in increase_types:
         expected_after = quantity_before + quantity_used
+    elif transaction_type in unchanged_types:
+        expected_after = quantity_before
+    elif transaction_type == "stock_ownership_assignment":
+        return "Verified" if quantity_before <= quantity_after <= quantity_before + quantity_used else "Review"
     else:
         return "Unverified"
 
