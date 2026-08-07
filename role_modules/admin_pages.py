@@ -175,11 +175,19 @@ def validate_location_selling_price(value, purchase_cost):
 
 def get_net_sold_quantity(cursor, item_code, owner_username=None):
     """Return sold units not reversed by customer returns, optionally for one stock owner."""
+    cursor.execute("PRAGMA table_info(transactions)")
+    transaction_columns = {str(row[1]).lower() for row in cursor.fetchall()}
+    has_transaction_owner = "affected_owner_username" in transaction_columns
+    cursor.execute("PRAGMA table_info(returns)")
+    return_columns = {str(row[1]).lower() for row in cursor.fetchall()}
+    has_owner_quantity = "owner_quantity" in return_columns
+    has_affected_owner = "affected_owner_username" in return_columns
     owner_filter = ""
     params = [item_code]
     if owner_username is not None:
         owner_filter = (
             " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),username))=LOWER(?)"
+            if has_transaction_owner else " AND LOWER(username)=LOWER(?)"
         )
         params.append(owner_username)
     cursor.execute(
@@ -191,7 +199,10 @@ def get_net_sold_quantity(cursor, item_code, owner_username=None):
     void_params = [item_code]
     void_filter = ""
     if owner_username is not None:
-        void_filter = " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),username))=LOWER(?)"
+        void_filter = (
+            " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),username))=LOWER(?)"
+            if has_transaction_owner else " AND LOWER(username)=LOWER(?)"
+        )
         void_params.append(owner_username)
     cursor.execute(
         f'''SELECT COALESCE(SUM(quantity_used),0) FROM transactions
@@ -204,14 +215,17 @@ def get_net_sold_quantity(cursor, item_code, owner_username=None):
     if owner_username is not None:
         return_filter = (
             " AND LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)"
+            if has_affected_owner else " AND LOWER(recorded_by)=LOWER(?)"
         )
         return_params.append(owner_username)
-    return_quantity_expression = (
-        "quantity"
-        if owner_username is None
-        else "CASE WHEN COALESCE(owner_quantity,0)>0 THEN owner_quantity "
-             "WHEN COALESCE(NULLIF(affected_owner_username,''),'')<>'' THEN quantity ELSE 0 END"
-    )
+    return_quantity_expression = "quantity"
+    if owner_username is not None:
+        return_quantity_expression = (
+            "CASE WHEN COALESCE(owner_quantity,0)>0 THEN owner_quantity "
+            "WHEN COALESCE(NULLIF(affected_owner_username,''),'')<>'' THEN quantity ELSE 0 END"
+            if has_owner_quantity and has_affected_owner
+            else "quantity"
+        )
     cursor.execute(
         f'''SELECT COALESCE(SUM({return_quantity_expression}),0) FROM returns
             WHERE LOWER(item_code)=LOWER(?) AND status='completed'
