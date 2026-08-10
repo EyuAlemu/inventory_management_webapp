@@ -24,6 +24,24 @@ def calculate_available_product_assignment(
     )
 
 
+def validate_sales_assignment_location(cursor, username):
+    """Require an active assigned location before reserving quantity for Sales."""
+    cursor.execute(
+        '''SELECT 1 FROM users u
+           JOIN user_locations ul ON LOWER(ul.username)=LOWER(u.username)
+           JOIN locations l ON l.id=ul.location_id
+           WHERE LOWER(u.username)=LOWER(?) AND LOWER(u.role)='sales'
+             AND COALESCE(l.active,0)=1
+           LIMIT 1''',
+        (username,),
+    )
+    if cursor.fetchone() is None:
+        raise ValueError(
+            "Assign this Sales user to an active location before assigning product quantity."
+        )
+    return True
+
+
 def calculate_location_edit_capacity(
     base_quantity, stock_elsewhere=0, user_stock=0, written_off=0, net_sold=0
 ):
@@ -2522,6 +2540,8 @@ def render(menu):
                             try:
                                 c.execute("BEGIN IMMEDIATE")
                                 if selected_supplier_user_role in {"admin", "sales", "user"}:
+                                    if selected_supplier_user_role == "sales":
+                                        validate_sales_assignment_location(c, supplier_username)
                                     quantity_to_assign = int(
                                         st.session_state.get(
                                             supplier_assignment_quantity_key,
@@ -2734,7 +2754,7 @@ def render(menu):
             conn
         )
         users_df = pd.read_sql_query(
-            "SELECT username, role FROM users WHERE role IN ('super_admin', 'admin', 'sales') ORDER BY username",
+            "SELECT username, role FROM users WHERE LOWER(role) IN ('super_admin', 'admin', 'sales', 'user') ORDER BY username",
             conn
         )
         assignments_df = pd.read_sql_query(
@@ -3079,35 +3099,51 @@ def render(menu):
             st.markdown('<div class="dashboard-section-title">Assign Users to Locations</div>', unsafe_allow_html=True)
 
             if locations_df.empty or users_df.empty:
-                st.info("Create at least one location and one admin or sales user before assigning location access.")
+                st.info("Create at least one location and one Admin, Sales, or Standard User before assigning location access.")
             else:
                 assignment_col, assignment_table_col = st.columns([0.9, 1.1])
 
                 with assignment_col:
-                    assignable_users_df = users_df[users_df["role"].isin(["admin", "sales"])]
+                    assignable_users_df = users_df[
+                        users_df["role"].fillna("").astype(str).str.lower().isin(
+                            ["admin", "sales", "user"]
+                        )
+                    ].copy()
 
                     if assignable_users_df.empty:
-                        st.info("Create an admin or sales user before assigning them to a location.")
+                        st.info("Create an Admin, Sales, or Standard User before assigning location access.")
                     else:
                         assignment_user = st.selectbox(
                             "User",
                             assignable_users_df["username"].tolist(),
                             key="assignment_user"
                         )
+                        active_assignment_locations_df = locations_df[
+                            locations_df["active"].fillna(0).astype(int) == 1
+                        ].copy()
                         assignment_location_options = {
                             f"{row['name']} (ID {row['id']})": int(row["id"])
-                            for _, row in locations_df.iterrows()
+                            for _, row in active_assignment_locations_df.iterrows()
                         }
-                        assignment_location = st.selectbox(
-                            "Location",
-                            list(assignment_location_options.keys()),
-                            key="assignment_location"
-                        )
+                        if not assignment_location_options:
+                            st.info("Activate or create a location before assigning location access.")
+                            assignment_location = None
+                        else:
+                            assignment_location = st.selectbox(
+                                "Active Location",
+                                list(assignment_location_options.keys()),
+                                key="assignment_location"
+                            )
 
                         assign_col, remove_col = st.columns(2)
 
                         with assign_col:
-                            if st.button("Assign Location", type="primary", width="stretch"):
+                            if st.button(
+                                "Assign Location",
+                                type="primary",
+                                width="stretch",
+                                disabled=assignment_location is None,
+                            ):
                                 conn = get_connection()
                                 c = conn.cursor()
 
@@ -3128,7 +3164,10 @@ def render(menu):
                                     conn.close()
 
                         with remove_col:
-                            selected_assignment_location_id = assignment_location_options[assignment_location]
+                            selected_assignment_location_id = (
+                                assignment_location_options[assignment_location]
+                                if assignment_location is not None else None
+                            )
                             confirm_remove_assignment = st.checkbox(
                                 f"Are you sure you want to remove {assignment_location} from {assignment_user}?",
                                 key=(
@@ -3139,7 +3178,7 @@ def render(menu):
                             if st.button(
                                 "Remove Assignment",
                                 width="stretch",
-                                disabled=not confirm_remove_assignment
+                                disabled=(not confirm_remove_assignment or selected_assignment_location_id is None)
                             ):
                                 conn = get_connection()
                                 try:
@@ -3160,7 +3199,7 @@ def render(menu):
 
                 with assignment_table_col:
                     if assignments_df.empty:
-                        st.info("No location assignments exist yet. Assign admins or sales users to locations to enable role-scoped access.")
+                        st.info("No location assignments exist yet. Assign Admin, Sales, or Standard Users to locations to enable role-scoped access.")
                     else:
                         st.dataframe(
                             assignments_df,

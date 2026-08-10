@@ -86,7 +86,7 @@ def get_assigned_location_ids(username=None):
 
     conn = get_connection()
     assigned_df = pd.read_sql_query(
-        "SELECT location_id FROM user_locations WHERE username=?",
+        "SELECT location_id FROM user_locations WHERE LOWER(username)=LOWER(?)",
         conn,
         params=(username,)
     )
@@ -106,7 +106,7 @@ def get_supplied_item_codes(username=None):
 
     conn = get_connection()
     supplied_df = pd.read_sql_query(
-        "SELECT item_code FROM product_suppliers WHERE username=?",
+        "SELECT item_code FROM product_suppliers WHERE LOWER(username)=LOWER(?)",
         conn,
         params=(username,)
     )

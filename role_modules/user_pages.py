@@ -1,13 +1,58 @@
-from role_modules.sales_pages import calculate_sales_receive_capacity, validate_sales_sale_access
+from role_modules.sales_pages import (
+    calculate_sales_available_assignment,
+    calculate_sales_receive_capacity,
+    get_net_sold_quantity,
+    get_sales_written_off_quantity,
+    sales_receive_limit_message,
+    validate_sales_sale_access,
+)
 
 
-def calculate_user_receive_capacity(assigned_quantity, received_quantity, company_available_quantity):
+def calculate_user_receive_capacity(
+    assigned_quantity, received_quantity, company_available_quantity,
+    consumed_quantity=0,
+):
     """Limit a Standard User receipt by their reservation and available company stock."""
     remaining_assignment = max(
-        int(assigned_quantity or 0) - int(received_quantity or 0),
+        int(assigned_quantity or 0)
+        - int(received_quantity or 0)
+        - int(consumed_quantity or 0),
         0,
     )
     return min(remaining_assignment, max(int(company_available_quantity or 0), 0))
+
+
+def get_user_consumed_assignment_quantity(cursor, username, item_code):
+    """Return Standard User units permanently consumed by sales or take-out."""
+    cursor.execute(
+        '''SELECT COALESCE(SUM(quantity_used),0) FROM transactions
+           WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
+             AND LOWER(COALESCE(transaction_type,'')) IN ('sale','take_out')''',
+        (username, item_code),
+    )
+    return max(int(cursor.fetchone()[0] or 0), 0)
+
+
+def validate_user_receive_access(cursor, username, location_id, item_code):
+    """Confirm current Standard User, active-location, and product assignments."""
+    cursor.execute(
+        '''SELECT 1
+           FROM users u
+           JOIN user_locations ul ON LOWER(ul.username)=LOWER(u.username)
+           JOIN locations l ON l.id=ul.location_id
+           JOIN product_suppliers ps ON LOWER(ps.username)=LOWER(u.username)
+           WHERE LOWER(u.username)=LOWER(?) AND LOWER(u.role)='user'
+             AND ul.location_id=? AND COALESCE(l.active,0)=1
+             AND LOWER(ps.item_code)=LOWER(?)
+           LIMIT 1''',
+        (username, location_id, item_code),
+    )
+    if cursor.fetchone() is None:
+        raise ValueError(
+            "This active location and product are not assigned to your account. "
+            "Refresh the page and choose your assigned records."
+        )
+    return True
 
 
 def validate_user_sale_access(cursor, username, item_code):
@@ -53,7 +98,7 @@ def render(menu):
         username_safe = safe_html(st.session_state.username)
         conn = get_connection()
         user_transactions_df = pd.read_sql_query(
-            "SELECT * FROM transactions WHERE username=? ORDER BY id DESC",
+            "SELECT * FROM transactions WHERE LOWER(username)=LOWER(?) ORDER BY id DESC",
             conn,
             params=(st.session_state.username,)
         )
@@ -61,8 +106,8 @@ def render(menu):
             '''
             SELECT ui.item_code, ui.quantity, i.item_name
             FROM user_inventory ui
-            LEFT JOIN inventory i ON ui.item_code = i.item_code
-            WHERE ui.username=?
+            LEFT JOIN inventory i ON LOWER(ui.item_code)=LOWER(i.item_code)
+            WHERE LOWER(ui.username)=LOWER(?)
             ORDER BY ui.quantity DESC
             ''',
             conn,
@@ -336,7 +381,7 @@ def render(menu):
         )
 
         assigned_location_ids = get_assigned_location_ids()
-        supplied_item_codes = set(get_supplied_item_codes())
+        supplied_item_codes = {str(code).lower() for code in get_supplied_item_codes()}
         conn = get_connection()
         manual_locations_df = pd.read_sql_query(
             "SELECT id, name, address FROM locations WHERE active=1 ORDER BY name",
@@ -348,14 +393,16 @@ def render(menu):
         )
         conn.close()
 
-        if get_current_role() == "sales":
+        if get_current_role() in {"sales", "user"}:
             manual_locations_df = manual_locations_df[
                 manual_locations_df["id"].isin(assigned_location_ids)
             ].copy()
 
         if get_current_role() in {"sales", "user"}:
             manual_inventory_df = manual_inventory_df[
-                manual_inventory_df["item_code"].isin(supplied_item_codes)
+                manual_inventory_df["item_code"].astype(str).str.lower().isin(
+                    supplied_item_codes
+                )
             ].copy()
 
         lookup_col, detail_col = st.columns([0.9, 1.1])
@@ -465,7 +512,7 @@ def render(menu):
                 c.execute(
                     '''
                     SELECT quantity FROM user_inventory
-                    WHERE username=? AND item_code=?
+                    WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                     ''',
                     (st.session_state.username, item_code)
                 )
@@ -474,7 +521,7 @@ def render(menu):
                 c.execute(
                     '''
                     SELECT quantity FROM location_inventory
-                    WHERE location_id=? AND item_code=?
+                    WHERE location_id=? AND LOWER(item_code)=LOWER(?)
                     ''',
                     (selected_location_id, item_code)
                 )
@@ -485,6 +532,8 @@ def render(menu):
                 sales_assigned_quantity = 0
                 sales_total_received_quantity = 0
                 sales_location_quantity = 0
+                sales_written_off_quantity = 0
+                sales_net_sold_quantity = 0
                 if receiving_sales_stock:
                     c.execute(
                         '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
@@ -519,10 +568,17 @@ def render(menu):
                         (selected_location_id, item_code)
                     )
                     selected_location_owned_quantity = int(c.fetchone()[0] or 0)
+                    sales_written_off_quantity = get_sales_written_off_quantity(
+                        c, item_code, st.session_state.username
+                    )
+                    sales_net_sold_quantity = get_net_sold_quantity(
+                        c, item_code, st.session_state.username
+                    )
                 else:
                     total_physical_quantity = 0
                     selected_location_owned_quantity = 0
                 user_assigned_quantity = 0
+                user_consumed_quantity = 0
                 if receiving_standard_user_stock:
                     c.execute(
                         '''SELECT COALESCE(SUM(quantity),0) FROM admin_location_stock
@@ -539,10 +595,14 @@ def render(menu):
                     user_assigned_quantity = (
                         int(user_assignment_row[0] or 0) if user_assignment_row else 0
                     )
+                    user_consumed_quantity = get_user_consumed_assignment_quantity(
+                        c, st.session_state.username, item_code
+                    )
                 user_available_to_receive = calculate_user_receive_capacity(
                     user_assigned_quantity,
                     user_quantity,
                     max(location_quantity - selected_location_owned_quantity, 0),
+                    user_consumed_quantity,
                 )
                 sales_available_to_receive = calculate_sales_receive_capacity(
                     sales_assigned_quantity,
@@ -551,7 +611,18 @@ def render(menu):
                     total_physical_quantity,
                     location_quantity,
                     selected_location_owned_quantity,
+                    sales_written_off_quantity,
+                    sales_net_sold_quantity,
                 )
+                sales_assignment_remaining = calculate_sales_available_assignment(
+                    sales_assigned_quantity,
+                    sales_total_received_quantity,
+                    sales_written_off_quantity,
+                    sales_net_sold_quantity,
+                )
+                sales_physical_capacity = max(
+                    location_quantity - selected_location_owned_quantity, 0
+                ) + max(int(item[4]) - total_physical_quantity, 0)
                 account_quantity = sales_location_quantity if receiving_sales_stock else user_quantity
                 account_label = "Location Qty" if receiving_sales_stock else "My Current Qty"
                 visible_status_quantity = (
@@ -666,9 +737,19 @@ def render(menu):
                         and transfer_qty_preview <= receive_capacity_preview
                     )
                     if transfer_qty is not None and transfer_qty_preview > receive_capacity_preview:
-                        st.warning(
-                            f"You can receive only {receive_capacity_preview} more unit(s) from your assignment."
-                        )
+                        if receiving_sales_stock:
+                            st.warning(
+                                sales_receive_limit_message(
+                                    receive_capacity_preview,
+                                    sales_assignment_remaining,
+                                    sales_physical_capacity,
+                                )
+                            )
+                        else:
+                            st.warning(
+                                f"You can receive only {receive_capacity_preview} more unit(s) "
+                                "from your assignment."
+                            )
                     if st.button(
                         receive_button_label,
                         type="primary",
@@ -711,6 +792,12 @@ def render(menu):
                                     (st.session_state.username, item_code)
                                 )
                                 locked_received_quantity = int(transfer_c.fetchone()[0] or 0)
+                                locked_written_off_quantity = get_sales_written_off_quantity(
+                                    transfer_c, item_code, st.session_state.username
+                                )
+                                locked_net_sold_quantity = get_net_sold_quantity(
+                                    transfer_c, item_code, st.session_state.username
+                                )
                                 transfer_c.execute(
                                     '''SELECT COALESCE(quantity,0) FROM admin_location_stock
                                        WHERE LOWER(username)=LOWER(?) AND location_id=?
@@ -723,14 +810,16 @@ def render(menu):
                                     if locked_sales_location_row else 0
                                 )
                             else:
-                                transfer_c.execute(
-                                    '''SELECT 1 FROM product_suppliers
-                                       WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)''',
-                                    (st.session_state.username, item_code)
-                                )
-                                if transfer_c.fetchone() is None:
+                                try:
+                                    validate_user_receive_access(
+                                        transfer_c,
+                                        st.session_state.username,
+                                        selected_location_id,
+                                        item_code,
+                                    )
+                                except ValueError as access_error:
                                     transfer_conn.rollback()
-                                    st.error("This product is no longer assigned to your account. Refresh and select an assigned item.")
+                                    st.error(str(access_error))
                                     st.stop()
                                 transfer_c.execute(
                                     '''SELECT COALESCE(quantity,0) FROM admin_product_allocations
@@ -742,6 +831,11 @@ def render(menu):
                                     int(locked_user_assignment_row[0] or 0)
                                     if locked_user_assignment_row else 0
                                 )
+                                locked_user_consumed_quantity = (
+                                    get_user_consumed_assignment_quantity(
+                                        transfer_c, st.session_state.username, item_code
+                                    )
+                                )
                             transfer_c.execute(
                                 "SELECT id, quantity FROM inventory WHERE item_code=?",
                                 (item_code,)
@@ -751,7 +845,7 @@ def render(menu):
                             transfer_c.execute(
                                 '''
                                 SELECT quantity FROM user_inventory
-                                WHERE username=? AND item_code=?
+                                WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                 ''',
                                 (st.session_state.username, item_code)
                             )
@@ -760,7 +854,7 @@ def render(menu):
                             transfer_c.execute(
                                 '''
                                 SELECT quantity FROM location_inventory
-                                WHERE location_id=? AND item_code=?
+                                WHERE location_id=? AND LOWER(item_code)=LOWER(?)
                                 ''',
                                 (selected_location_id, item_code)
                             )
@@ -798,12 +892,31 @@ def render(menu):
                                         locked_total_physical_quantity,
                                         location_quantity_before,
                                         locked_selected_location_owned,
+                                        locked_written_off_quantity,
+                                        locked_net_sold_quantity,
                                     )
                                     if transfer_qty_int > locked_available_to_receive:
                                         transfer_conn.rollback()
                                         st.error(
-                                            f"You can receive only {locked_available_to_receive} more unit(s). "
-                                            "This limit uses your remaining assignment and company physical capacity."
+                                            sales_receive_limit_message(
+                                                locked_available_to_receive,
+                                                calculate_sales_available_assignment(
+                                                    locked_assigned_quantity,
+                                                    locked_received_quantity,
+                                                    locked_written_off_quantity,
+                                                    locked_net_sold_quantity,
+                                                ),
+                                                max(
+                                                    location_quantity_before
+                                                    - locked_selected_location_owned,
+                                                    0,
+                                                )
+                                                + max(
+                                                    system_quantity_before
+                                                    - locked_total_physical_quantity,
+                                                    0,
+                                                ),
+                                            )
                                         )
                                         st.stop()
 
@@ -815,6 +928,7 @@ def render(menu):
                                             location_quantity_before - locked_selected_location_owned,
                                             0,
                                         ),
+                                        locked_user_consumed_quantity,
                                     )
                                     if transfer_qty_int > locked_user_available_to_receive:
                                         transfer_conn.rollback()
@@ -999,6 +1113,17 @@ def render(menu):
 
                                     try:
                                         return_c.execute("BEGIN IMMEDIATE")
+                                        try:
+                                            validate_user_receive_access(
+                                                return_c,
+                                                st.session_state.username,
+                                                selected_location_id,
+                                                item_code,
+                                            )
+                                        except ValueError as access_error:
+                                            return_conn.rollback()
+                                            st.error(str(access_error))
+                                            st.stop()
                                         return_c.execute(
                                             "SELECT id FROM inventory WHERE LOWER(item_code)=LOWER(?)",
                                             (item_code,)
@@ -1017,7 +1142,7 @@ def render(menu):
                                         return_c.execute(
                                             '''
                                             SELECT quantity FROM user_inventory
-                                            WHERE username=? AND item_code=?
+                                            WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                             ''',
                                             (st.session_state.username, item_code)
                                         )
@@ -1045,7 +1170,7 @@ def render(menu):
                                                 '''
                                                 UPDATE user_inventory
                                                 SET quantity=?
-                                                WHERE username=? AND item_code=?
+                                                WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                                 ''',
                                                 (user_quantity_after, st.session_state.username, item_code)
                                             )
@@ -1117,7 +1242,7 @@ def render(menu):
                                         take_out_c.execute(
                                             '''
                                             SELECT quantity FROM user_inventory
-                                            WHERE username=? AND item_code=?
+                                            WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                             ''',
                                             (st.session_state.username, item_code)
                                         )
@@ -1135,7 +1260,7 @@ def render(menu):
                                                 '''
                                                 UPDATE user_inventory
                                                 SET quantity=?
-                                                WHERE username=? AND item_code=?
+                                                WHERE LOWER(username)=LOWER(?) AND LOWER(item_code)=LOWER(?)
                                                 ''',
                                                 (user_quantity_after, st.session_state.username, item_code)
                                             )
@@ -1487,7 +1612,10 @@ def render(menu):
             else:
                 df = df.iloc[0:0].copy()
         elif not has_admin_access() and not df.empty:
-            df = df[df["username"] == st.session_state.username].copy()
+            df = df[
+                df["username"].fillna("").astype(str).str.lower()
+                == str(st.session_state.username).lower()
+            ].copy()
 
         transaction_scope_description = (
             "Review company-wide inventory usage history by user, item code, quantity, and time."

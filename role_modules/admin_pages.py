@@ -4760,20 +4760,30 @@ def render(menu):
                 return_stock_df["location_id"].isin(assigned_location_ids)
             ].copy()
             returns_df = returns_df[returns_df["location_id"].isin(assigned_location_ids)].copy()
-            returns_df = returns_df.loc[
-                returns_df["recorded_by"].astype(str).str.lower()
-                == str(st.session_state.username).lower()
-            ].copy()
+            current_username_lower = str(st.session_state.username).lower()
+            if get_current_role() == "sales":
+                returns_df = returns_df.loc[
+                    (returns_df["recorded_by"].astype(str).str.lower() == current_username_lower)
+                    | (returns_df["invoice_created_by"].astype(str).str.lower() == current_username_lower)
+                    | (returns_df["affected_owner_username"].astype(str).str.lower() == current_username_lower)
+                ].copy()
+            else:
+                returns_df = returns_df.loc[
+                    returns_df["recorded_by"].astype(str).str.lower()
+                    == current_username_lower
+                ].copy()
 
             if get_current_role() in {"admin", "sales"}:
-                supplied_item_codes = set(get_supplied_item_codes())
+                supplied_item_codes = {str(code).lower() for code in get_supplied_item_codes()}
                 inventory_df = inventory_df[
-                    inventory_df["item_code"].isin(supplied_item_codes)
+                    inventory_df["item_code"].astype(str).str.lower().isin(supplied_item_codes)
                 ].copy()
                 return_stock_df = return_stock_df[
-                    return_stock_df["item_code"].isin(supplied_item_codes)
+                    return_stock_df["item_code"].astype(str).str.lower().isin(supplied_item_codes)
                 ].copy()
-                returns_df = returns_df[returns_df["item_code"].isin(supplied_item_codes)].copy()
+                returns_df = returns_df[
+                    returns_df["item_code"].astype(str).str.lower().isin(supplied_item_codes)
+                ].copy()
 
         st.markdown(
             """

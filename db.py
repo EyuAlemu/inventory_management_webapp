@@ -446,6 +446,27 @@ def init_db():
         '''
     )
 
+    # A Standard User's positive personal stock must never be stranded by a
+    # missing product-access row.  New removals are blocked in the Super Admin
+    # workflow; this repairs legacy databases created before that validation.
+    c.execute(
+        '''
+        INSERT INTO product_suppliers (username, item_code)
+        SELECT ui.username, ui.item_code
+        FROM user_inventory ui
+        INNER JOIN users u
+            ON LOWER(u.username)=LOWER(ui.username)
+           AND LOWER(COALESCE(u.role,''))='user'
+        INNER JOIN inventory i
+            ON LOWER(i.item_code)=LOWER(ui.item_code)
+        LEFT JOIN product_suppliers ps
+            ON LOWER(ps.username)=LOWER(ui.username)
+           AND LOWER(ps.item_code)=LOWER(ui.item_code)
+        WHERE COALESCE(ui.quantity,0)>0
+          AND ps.id IS NULL
+        '''
+    )
+
     c.execute(
         '''
         INSERT INTO admin_product_allocations (username, item_code, quantity)

@@ -1,17 +1,51 @@
-from role_modules.admin_pages import consume_invoice_location_ownership
+from role_modules.admin_pages import consume_invoice_location_ownership, get_net_sold_quantity
 
 
-def calculate_sales_available_assignment(assigned_quantity, placed_quantity):
-    """Return how many more units a Sales user may receive from an assignment."""
-    return max(int(assigned_quantity or 0) - int(placed_quantity or 0), 0)
+def calculate_sales_available_assignment(
+    assigned_quantity, placed_quantity, written_off_quantity=0, sold_quantity=0,
+):
+    """Return unused Sales reservation after stock placement and permanent consumption."""
+    return max(
+        int(assigned_quantity or 0)
+        - int(placed_quantity or 0)
+        - int(written_off_quantity or 0)
+        - int(sold_quantity or 0),
+        0,
+    )
+
+
+def get_sales_written_off_quantity(cursor, item_code, username):
+    """Return damaged/bad units charged to one Sales user's assignment."""
+    cursor.execute("PRAGMA table_info(returns)")
+    columns = {str(row[1]).lower() for row in cursor.fetchall()}
+    has_owner = "affected_owner_username" in columns
+    has_owner_quantity = "owner_quantity" in columns
+    owner_filter = (
+        "LOWER(COALESCE(NULLIF(affected_owner_username,''),recorded_by))=LOWER(?)"
+        if has_owner else "LOWER(recorded_by)=LOWER(?)"
+    )
+    quantity_expression = (
+        "CASE WHEN COALESCE(owner_quantity,0)>0 THEN owner_quantity ELSE quantity END"
+        if has_owner_quantity else "quantity"
+    )
+    cursor.execute(
+        f'''SELECT COALESCE(SUM({quantity_expression}),0) FROM returns
+            WHERE LOWER(item_code)=LOWER(?) AND status='completed'
+              AND condition_status<>'customer_return' AND {owner_filter}''',
+        (item_code, username),
+    )
+    return max(int(cursor.fetchone()[0] or 0), 0)
 
 
 def calculate_sales_receive_capacity(
     assigned_quantity, placed_quantity, base_quantity, physical_quantity,
     selected_location_quantity=0, selected_location_owned_quantity=0,
+    written_off_quantity=0, sold_quantity=0,
 ):
     """Cap a Sales receipt by reservation plus usable unowned/company capacity."""
-    assignment_available = calculate_sales_available_assignment(assigned_quantity, placed_quantity)
+    assignment_available = calculate_sales_available_assignment(
+        assigned_quantity, placed_quantity, written_off_quantity, sold_quantity,
+    )
     unlocated_capacity = max(int(base_quantity or 0) - int(physical_quantity or 0), 0)
     unowned_at_location = max(
         int(selected_location_quantity or 0) - int(selected_location_owned_quantity or 0),
@@ -29,6 +63,33 @@ def calculate_sales_payment_status(total, paid):
     if paid_value > 0:
         return "Partially Paid"
     return "Credit / Unpaid"
+
+
+def is_counted_sales_invoice(status):
+    """Return whether an invoice still represents an active dashboard sale."""
+    return str(status or "").strip().lower() not in {
+        "void", "voided", "cancelled", "canceled",
+    }
+
+
+def sales_receive_limit_message(available, assignment_remaining, physical_capacity):
+    """Explain which limiter controls a Sales receipt."""
+    available = max(int(available or 0), 0)
+    assignment_remaining = max(int(assignment_remaining or 0), 0)
+    physical_capacity = max(int(physical_capacity or 0), 0)
+    if assignment_remaining <= 0:
+        return "Your Sales assignment has no remaining quantity available to receive."
+    if physical_capacity <= 0:
+        return (
+            f"You still have {assignment_remaining} assigned unit(s), but this location has "
+            "no unowned stock and the company has no unused physical capacity."
+        )
+    if physical_capacity < assignment_remaining:
+        return (
+            f"You can receive only {available} more unit(s) because available company stock "
+            "and physical capacity are lower than your remaining assignment."
+        )
+    return f"You can receive only {available} more unit(s) from your remaining assignment."
 
 
 def validate_sales_sale_access(cursor, username, location_id, item_code):
@@ -90,8 +151,9 @@ def render(menu):
                    COALESCE(lp.price, 0) AS price
             FROM location_inventory li
             LEFT JOIN locations l ON li.location_id = l.id
-            LEFT JOIN inventory i ON li.item_code = i.item_code
-            LEFT JOIN location_prices lp ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+            LEFT JOIN inventory i ON LOWER(li.item_code)=LOWER(i.item_code)
+            LEFT JOIN location_prices lp ON lp.location_id=li.location_id
+                AND LOWER(lp.item_code)=LOWER(li.item_code)
             LEFT JOIN admin_location_stock als
                 ON als.location_id=li.location_id AND LOWER(als.item_code)=LOWER(li.item_code)
                AND LOWER(als.username)=LOWER(?)
@@ -106,7 +168,7 @@ def render(menu):
                    inv.total, inv.status, inv.created_at
             FROM invoices inv
             LEFT JOIN locations l ON inv.location_id = l.id
-            WHERE inv.created_by=?
+            WHERE LOWER(inv.created_by)=LOWER(?)
             ORDER BY inv.id DESC
             ''',
             conn,
@@ -120,8 +182,9 @@ def render(menu):
         sales_stock_df = sales_stock_df[
             sales_stock_df["location_id"].isin(assigned_location_ids)
         ].copy()
+        supplied_item_codes_lower = {str(code).lower() for code in supplied_item_codes}
         sales_stock_df = sales_stock_df[
-            sales_stock_df["item_code"].isin(supplied_item_codes)
+            sales_stock_df["item_code"].astype(str).str.lower().isin(supplied_item_codes_lower)
         ].copy()
         sales_stock_df = sales_stock_df[sales_stock_df["price"] > 0].copy()
         sales_invoice_df = sales_invoice_df[
@@ -131,8 +194,14 @@ def render(menu):
         assigned_location_count = len(sales_locations_df)
         available_items = sales_stock_df["item_code"].nunique() if not sales_stock_df.empty else 0
         available_units = int(sales_stock_df["quantity"].sum()) if not sales_stock_df.empty else 0
-        invoices_created = len(sales_invoice_df)
-        invoice_total = float(sales_invoice_df["total"].sum()) if not sales_invoice_df.empty else 0
+        counted_sales_invoice_df = sales_invoice_df[
+            sales_invoice_df["status"].apply(is_counted_sales_invoice)
+        ].copy()
+        invoices_created = len(counted_sales_invoice_df)
+        invoice_total = (
+            float(counted_sales_invoice_df["total"].sum())
+            if not counted_sales_invoice_df.empty else 0
+        )
 
         st.markdown(
             f"""
@@ -274,9 +343,10 @@ def render(menu):
                    MIN(li.quantity, COALESCE(als.quantity,0)) AS quantity,
                    COALESCE(lp.price, 0) AS price
             FROM location_inventory li
-            LEFT JOIN inventory i ON li.item_code = i.item_code
+            LEFT JOIN inventory i ON LOWER(li.item_code)=LOWER(i.item_code)
             LEFT JOIN location_prices lp
-                ON lp.location_id = li.location_id AND lp.item_code = li.item_code
+                ON lp.location_id=li.location_id
+               AND LOWER(lp.item_code)=LOWER(li.item_code)
             LEFT JOIN admin_location_stock als
                 ON als.location_id=li.location_id AND LOWER(als.item_code)=LOWER(li.item_code)
                AND LOWER(als.username)=LOWER(?)
@@ -290,7 +360,10 @@ def render(menu):
 
         locations_df = locations_df[locations_df["id"].isin(assigned_location_ids)].copy()
         inventory_df = inventory_df[inventory_df["location_id"].isin(assigned_location_ids)].copy()
-        inventory_df = inventory_df[inventory_df["item_code"].isin(supplied_item_codes)].copy()
+        supplied_item_codes_lower = {str(code).lower() for code in supplied_item_codes}
+        inventory_df = inventory_df[
+            inventory_df["item_code"].astype(str).str.lower().isin(supplied_item_codes_lower)
+        ].copy()
         inventory_df = inventory_df[inventory_df["price"] > 0].copy()
 
         st.markdown(
@@ -721,7 +794,7 @@ def render(menu):
                         c.execute(
                             '''
                             SELECT quantity FROM location_inventory
-                            WHERE location_id=? AND item_code=?
+                            WHERE location_id=? AND LOWER(item_code)=LOWER(?)
                             ''',
                             (selected_location_id, selected_item_code)
                         )
@@ -731,7 +804,7 @@ def render(menu):
                         c.execute(
                             '''
                             SELECT COALESCE(price, 0) FROM location_prices
-                            WHERE location_id=? AND item_code=?
+                            WHERE location_id=? AND LOWER(item_code)=LOWER(?)
                             ''',
                             (selected_location_id, selected_item_code)
                         )
@@ -767,7 +840,7 @@ def render(menu):
                                 '''
                                 UPDATE location_inventory
                                 SET quantity=?
-                                WHERE location_id=? AND item_code=?
+                                WHERE location_id=? AND LOWER(item_code)=LOWER(?)
                                 ''',
                                 (current_quantity - quantity_int, selected_location_id, selected_item_code)
                             )
